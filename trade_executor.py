@@ -30,7 +30,7 @@ import MetaTrader5 as mt5
 
 from config import (
     SYMBOL, MAGIC_NUMBER, DEVIATION,
-    LOG_LEVEL, PAPER_TRADE_MODE,
+    LOG_LEVEL, PAPER_TRADE_MODE, BREAKEVEN_TRIGGER,
 )
 
 log = logging.getLogger(__name__)
@@ -313,7 +313,7 @@ def modify_sl_to_breakeven(
 def monitor_open_trades(
     symbol: str = SYMBOL,
     magic:  int = MAGIC_NUMBER,
-    be_trigger_pct: float = 0.50,   # move SL to BE when 50% of the way to TP
+    be_trigger_pct: float = BREAKEVEN_TRIGGER,
 ) -> list[TradeInfo]:
     """
     Scan all open positions, calculate progress to TP, and
@@ -323,7 +323,8 @@ def monitor_open_trades(
     ----------
     be_trigger_pct : float
         When current price has moved this fraction of the way from
-        entry to TP, SL is moved to entry (breakeven).  Default: 0.50.
+        entry to TP, SL is moved to entry (breakeven).
+        Defaults to BREAKEVEN_TRIGGER from config.py.
 
     Returns
     -------

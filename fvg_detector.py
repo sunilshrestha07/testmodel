@@ -37,6 +37,22 @@ MIN_RR       = 1.5   # discard setups below this reward:risk ratio
 M5_LOOKBACK  = 100   # M5 candles to scan for FVG
 M1_LOOKBACK  = 200   # M1 candles to scan for MSS
 
+# Quality-filter thresholds (applied in all detection functions)
+MIN_FVG_PIPS          = 3.0   # FVG must be at least 3 pips wide
+FVG_FRESHNESS_CANDLES = 5     # FVG must form within ±5 candles of the MSS
+MIN_MSS_BREAK_PIPS    = 3.0   # MSS close must exceed the reference level by ≥ 3 pips
+MIN_MSS_BODY_RATIO    = 0.60  # MSS candle body ≥ 60 % of its total H-L range
+MIN_RETRACE_PCT       = 0.20  # after MSS, price must retrace ≥ 20 % of impulse  (was 30%)
+MIN_OB_PIPS           = 5.0   # Order Block body must be ≥ 5 pips wide
+
+# Strong-sweep MSS relaxation
+# When the sweep wick extends more than STRONG_SWEEP_PIPS beyond the key level,
+# the sweep itself is strong institutional confirmation. The MSS body-ratio filter
+# is relaxed from 0.60 → 0.40 so that less decisive candles can still qualify.
+# min_break_pips (3 pips) is NOT relaxed — the structure break must still be real.
+STRONG_SWEEP_PIPS           = 5.0   # wick depth (pips) that qualifies as "strong"
+STRONG_SWEEP_MSS_BODY_RATIO = 0.40  # relaxed body/range ratio for strong-sweep sessions
+
 
 # --- Data classes -------------------------------------------------------------
 
@@ -353,134 +369,242 @@ def diagnose_sweep_miss(
 # --- 2. Fair Value Gap --------------------------------------------------------
 
 def detect_fvg(
-    candles:   pd.DataFrame,
-    direction: str,
-    start_idx: int = 0,
+    candles:       pd.DataFrame,
+    direction:     str,
+    start_idx:     int   = 0,
+    mss_idx:       int   = -1,
+    min_pips:      float = MIN_FVG_PIPS,
+    current_price: float = 0.0,
+    swing_high:    float = 0.0,
+    swing_low:     float = 0.0,
 ) -> Optional[FVGZone]:
     """
-    Scan candles[start_idx:] for the most recent unfilled FVG.
+    Scan candles[start_idx:] for qualifying unfilled FVGs, then return the
+    best candidate.
 
-    Bullish FVG  (3-candle upward imbalance):
-      candle[i].high < candle[i+2].low
-      -- gap exists between C1 top and C3 bottom
+    Quality filters applied:
+      • Minimum width  : gap >= min_pips * PIP_VALUE  (default 3 pips)
+      • Freshness      : when mss_idx >= 0, FVG candle index must be within
+                         ±FVG_FRESHNESS_CANDLES of mss_idx
+      • Zone           : when swing_high/swing_low are non-zero, FVG midpoint
+                         must be in discount zone (bullish: below equilibrium)
+                         or premium zone (bearish: above equilibrium)
+      • Not filled     : subsequent price action has not traded back into the gap
 
-    Bearish FVG  (3-candle downward imbalance):
-      candle[i].low > candle[i+2].high
-      -- gap exists between C1 bottom and C3 top
+    Candidate selection (when multiple FVGs pass all filters):
+      • If current_price > 0 → pick the FVG whose midpoint is closest to price
+        (most relevant pullback target)
+      • Otherwise → pick the most recent one (highest candle index)
 
-    "Unfilled" = the current close has not traded back into the gap.
-
-    Returns the most recent qualifying FVG, or None.
+    Returns the selected FVGZone, or None when no FVG passes all filters.
     """
     highs  = candles["high"].values
     lows   = candles["low"].values
-    closes = candles["close"].values
     n      = len(candles)
 
-    # Scan newest -> oldest so we return the freshest FVG first
+    # Zone equilibrium (used when swing levels are provided)
+    _zone_active = swing_high > 0 and swing_low > 0 and swing_high > swing_low
+    _equilibrium = (swing_high + swing_low) / 2.0 if _zone_active else 0.0
+
+    candidates: list[FVGZone] = []
+
     for i in range(n - 3, max(start_idx - 1, -1), -1):
+        # Freshness: FVG must be within ±FVG_FRESHNESS_CANDLES of the MSS
+        if mss_idx >= 0:
+            if i < mss_idx - FVG_FRESHNESS_CANDLES:
+                break   # scanning oldest → no point going further
+            if i > mss_idx + FVG_FRESHNESS_CANDLES:
+                continue
+
         if direction == "bullish":
             gap_bottom = highs[i]
             gap_top    = lows[i + 2]
-            if gap_top > gap_bottom:                  # gap exists
-                midpoint = (gap_top + gap_bottom) / 2
-                # Check not already filled by subsequent price action
-                filled = any(lows[j] <= gap_bottom for j in range(i + 3, n))
-                return FVGZone(
-                    top=gap_top,
-                    bottom=gap_bottom,
-                    midpoint=midpoint,
-                    candle_index=i,
-                    direction="bullish",
-                    filled=filled,
-                )
+            if gap_top <= gap_bottom:
+                continue
+            width = gap_top - gap_bottom
 
         elif direction == "bearish":
             gap_top    = lows[i]
             gap_bottom = highs[i + 2]
-            if gap_top > gap_bottom:                  # gap exists
-                midpoint = (gap_top + gap_bottom) / 2
-                filled = any(highs[j] >= gap_top for j in range(i + 3, n))
-                return FVGZone(
-                    top=gap_top,
-                    bottom=gap_bottom,
-                    midpoint=midpoint,
-                    candle_index=i,
-                    direction="bearish",
-                    filled=filled,
-                )
+            if gap_top <= gap_bottom:
+                continue
+            width = gap_top - gap_bottom
 
-    return None
+        else:
+            continue
+
+        # Minimum width filter
+        if width < min_pips * PIP_VALUE:
+            continue
+
+        midpoint = (gap_top + gap_bottom) / 2.0
+
+        # Zone filter (discount for longs, premium for shorts)
+        if _zone_active:
+            if direction == "bullish" and midpoint >= _equilibrium:
+                continue   # must be below equilibrium (discount zone)
+            if direction == "bearish" and midpoint <= _equilibrium:
+                continue   # must be above equilibrium (premium zone)
+
+        # Filled check: gap violated by subsequent price action
+        if direction == "bullish":
+            filled = any(lows[j] <= gap_bottom for j in range(i + 3, n))
+        else:
+            filled = any(highs[j] >= gap_top for j in range(i + 3, n))
+
+        if filled:
+            continue
+
+        candidates.append(FVGZone(
+            top=gap_top, bottom=gap_bottom, midpoint=midpoint,
+            candle_index=i, direction=direction, filled=False,
+        ))
+
+    if not candidates:
+        return None
+
+    # Select the best candidate
+    if current_price > 0:
+        # Closest midpoint to current price (most likely pullback target)
+        return min(candidates, key=lambda z: abs(z.midpoint - current_price))
+
+    # Default: most recent (highest candle index = most recently formed)
+    return max(candidates, key=lambda z: z.candle_index)
 
 
 # --- 3. Market Structure Shift ------------------------------------------------
 
 def detect_market_structure_shift(
-    candles:   pd.DataFrame,
-    direction: str,
-    after_idx: int = 0,
+    candles:        pd.DataFrame,
+    direction:      str,
+    after_idx:      int   = 0,
+    min_break_pips: float = MIN_MSS_BREAK_PIPS,
+    min_body_ratio: float = MIN_MSS_BODY_RATIO,
 ) -> MSSResult:
     """
     Detect a Market Structure Shift (MSS / CHoCH) in candles[after_idx:].
 
     Bullish MSS: a candle closes ABOVE the highest high seen in the window
-                 that precedes the sweep (i.e. a break of structure to the upside)
-
+                 that precedes the sweep (break of structure to the upside).
     Bearish MSS: a candle closes BELOW the lowest low seen in the window
-                 that precedes the sweep
+                 that precedes the sweep.
 
-    `after_idx` lets the caller anchor the scan to start right after the
-    liquidity sweep candle.
+    Quality filters (applied to each candidate break candle):
+      • min_break_pips  : close must exceed the reference level by at least
+                          this many pips (default 3) — prevents 1-pip tickle breaks
+      • min_body_ratio  : abs(close - open) / (high - low) >= ratio (default 0.60)
+                          — requires a decisive body, not a wick MSS
+
+    If a candidate fails quality, the scan continues searching (ref level still
+    advances) so a later, stronger break can still qualify.
 
     Returns MSSResult with the first qualifying candle.
     """
+    opens  = candles["open"].values
     closes = candles["close"].values
     highs  = candles["high"].values
     lows   = candles["low"].values
     n      = len(candles)
     start  = max(after_idx, 1)
+    min_break = min_break_pips * PIP_VALUE
 
     if direction == "bullish":
-        # Reference level = highest high in the pre-sweep window
         ref_high = highs[after_idx:start + 1].max() if start > after_idx else highs[after_idx]
         for i in range(start, n):
-            if closes[i] > ref_high:
-                return MSSResult(found=True, candle_index=i, break_price=closes[i])
-            # Update reference as new highs form (we want the most relevant break)
+            if closes[i] > ref_high + min_break:
+                body  = abs(closes[i] - opens[i])
+                total = highs[i] - lows[i]
+                if total <= 0 or (body / total) >= min_body_ratio:
+                    return MSSResult(found=True, candle_index=i, break_price=closes[i])
+            # Always advance ref so a stronger break later is measured correctly
             ref_high = max(ref_high, highs[i])
 
     elif direction == "bearish":
         ref_low = lows[after_idx:start + 1].min() if start > after_idx else lows[after_idx]
         for i in range(start, n):
-            if closes[i] < ref_low:
-                return MSSResult(found=True, candle_index=i, break_price=closes[i])
+            if closes[i] < ref_low - min_break:
+                body  = abs(closes[i] - opens[i])
+                total = highs[i] - lows[i]
+                if total <= 0 or (body / total) >= min_body_ratio:
+                    return MSSResult(found=True, candle_index=i, break_price=closes[i])
             ref_low = min(ref_low, lows[i])
 
     return MSSResult(found=False)
 
 
+# --- 3b. MSS retrace validator -----------------------------------------------
+
+def check_mss_retrace(
+    candles:     pd.DataFrame,
+    mss_idx:     int,
+    mss_close:   float,
+    sweep_price: float,
+    direction:   str,
+    min_pct:     float = MIN_RETRACE_PCT,
+) -> bool:
+    """
+    After a MSS, verify that price retraced at least min_pct (30 %) of the
+    impulse move back toward the sweep extreme before the FVG entry triggers.
+
+    Bullish:
+      impulse     = mss_close - sweep_low   (sweep_price is the wick low)
+      retrace_tgt = mss_close - min_pct * impulse
+      Pass when any candle after mss_idx has a low ≤ retrace_tgt.
+
+    Bearish:
+      impulse     = sweep_high - mss_close
+      retrace_tgt = mss_close + min_pct * impulse
+      Pass when any candle after mss_idx has a high ≥ retrace_tgt.
+
+    Returns True (pass) in edge cases: no candles after MSS, or the impulse
+    is less than 2 pips (too small to validate meaningfully).
+    """
+    n = len(candles)
+    if mss_idx >= n - 1:
+        return True   # no candles after MSS; can't verify — don't block
+
+    impulse = abs(mss_close - sweep_price)
+    if impulse < PIP_VALUE * 2:
+        return True   # micro-move; skip check
+
+    highs = candles["high"].values
+    lows  = candles["low"].values
+
+    if direction == "bullish":
+        target = mss_close - min_pct * impulse
+        return any(lows[i] <= target for i in range(mss_idx + 1, n))
+    else:
+        target = mss_close + min_pct * impulse
+        return any(highs[i] >= target for i in range(mss_idx + 1, n))
+
+
 # --- 4. Order Block & MSS-candle entry (fallback when no FVG) -----------------
 
 def detect_order_block(
-    candles:   pd.DataFrame,
-    direction: str,
-    sweep_idx: int,
-    mss_idx:   int,
+    candles:     pd.DataFrame,
+    direction:   str,
+    sweep_idx:   int,
+    mss_idx:     int,
+    min_ob_pips: float = MIN_OB_PIPS,
 ) -> OrderBlockResult:
     """
-    Find the ICT Order Block — the last opposing candle between the
-    liquidity sweep and the MSS.
+    Find the ICT Order Block — the LAST opposing candle immediately before
+    the MSS impulse, scanning from MSS back toward the sweep.
 
     Bullish OB (serves LONG entry):
-      Last BEARISH candle (close < open) in candles[sweep_idx:mss_idx+1].
+      Last BEARISH candle (close < open) in candles[sweep_idx:mss_idx].
       Entry at body midpoint.  SL reference = candle low.
 
     Bearish OB (serves SHORT entry):
-      Last BULLISH candle (close > open) in candles[sweep_idx:mss_idx+1].
+      Last BULLISH candle (close > open) in candles[sweep_idx:mss_idx].
       Entry at body midpoint.  SL reference = candle high.
 
-    Scans newest-to-oldest (closest to MSS first) to get the most
-    recent valid OB.
+    Quality filters:
+      • min_ob_pips  : OB body (|close - open|) must be ≥ 5 pips
+      • Untested     : no candle after the OB (up to end of sub-window) has
+                       closed back through the OB body, invalidating the level
+
+    Scans newest-to-oldest (closest to MSS first).
     """
     n = len(candles)
     if mss_idx < 0 or mss_idx >= n:
@@ -491,22 +615,45 @@ def detect_order_block(
     highs  = candles["high"].values
     lows   = candles["low"].values
 
-    end   = min(mss_idx, n - 1)
+    end   = min(mss_idx - 1, n - 1)   # OB must be BEFORE the MSS candle itself
     start = max(sweep_idx, 0)
+    min_body = min_ob_pips * PIP_VALUE
 
     for i in range(end, start - 1, -1):
         if direction == "bullish" and closes[i] < opens[i]:   # bearish candle → bullish OB
-            body_top    = opens[i]    # open > close for a bearish candle
+            body_top    = opens[i]
             body_bottom = closes[i]
+            body_size   = body_top - body_bottom
+
+            # Minimum size
+            if body_size < min_body:
+                continue
+
+            # Untested: no subsequent candle has closed below the OB body bottom
+            # (a close below body_bottom would invalidate the OB as support)
+            if any(closes[j] < body_bottom for j in range(i + 1, n)):
+                continue
+
             return OrderBlockResult(
                 found=True, candle_index=i, direction="bullish",
                 body_top=body_top, body_bottom=body_bottom,
                 midpoint=(body_top + body_bottom) / 2,
                 candle_high=highs[i], candle_low=lows[i],
             )
+
         if direction == "bearish" and closes[i] > opens[i]:   # bullish candle → bearish OB
-            body_top    = closes[i]   # close > open for a bullish candle
+            body_top    = closes[i]
             body_bottom = opens[i]
+            body_size   = body_top - body_bottom
+
+            # Minimum size
+            if body_size < min_body:
+                continue
+
+            # Untested: no subsequent candle has closed above the OB body top
+            if any(closes[j] > body_top for j in range(i + 1, n)):
+                continue
+
             return OrderBlockResult(
                 found=True, candle_index=i, direction="bearish",
                 body_top=body_top, body_bottom=body_bottom,
@@ -660,6 +807,16 @@ def get_entry_setup(
     m1_after   = df_m1.index.searchsorted(sweep_time)
 
     mss = detect_market_structure_shift(df_m1, direction, after_idx=m1_after)
+    if not mss.found:
+        # Strong sweep: wick > STRONG_SWEEP_PIPS beyond the level gives extra
+        # institutional confirmation, so relax the MSS body-ratio requirement.
+        sweep_depth = abs(sweep.sweep_price - sweep.level) / PIP_VALUE
+        if sweep_depth > STRONG_SWEEP_PIPS:
+            mss = detect_market_structure_shift(
+                df_m1, direction, after_idx=m1_after,
+                min_break_pips=MIN_MSS_BREAK_PIPS,
+                min_body_ratio=STRONG_SWEEP_MSS_BODY_RATIO,
+            )
     if not mss.found:
         return EntrySetup(
             valid=False,

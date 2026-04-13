@@ -35,12 +35,16 @@ import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
 
-from config import SYMBOL, DXY_SYMBOL, MAGIC_NUMBER, LOG_LEVEL
+from config import SYMBOL, DXY_SYMBOL, MAGIC_NUMBER, LOG_LEVEL, BREAKEVEN_TRIGGER
 from mt5_connector import connect, disconnect
 from fvg_detector import (
     detect_fvg, detect_liquidity_sweep, detect_market_structure_shift,
+    check_mss_retrace,
     is_fvg_in_correct_zone, diagnose_sweep_miss,
     detect_order_block, detect_mss_candle_entry, FVGZone,
+    MIN_FVG_PIPS, MIN_MSS_BREAK_PIPS, MIN_MSS_BODY_RATIO,
+    MIN_RETRACE_PCT, MIN_OB_PIPS,
+    STRONG_SWEEP_PIPS, STRONG_SWEEP_MSS_BODY_RATIO,
 )
 from market_structure import get_swing_highs_lows
 from risk_manager import calculate_lot_size
@@ -57,7 +61,7 @@ NPT          = timezone(timedelta(hours=5, minutes=45))
 UTC          = timezone.utc
 ACCOUNT_SIZE = 100_000.0      # starting balance for simulation
 RISK_PCT     = 1.0            # % risk per trade
-BE_TRIGGER   = 0.50           # move SL to entry at 50% of way to TP
+BE_TRIGGER   = BREAKEVEN_TRIGGER   # move SL to entry; set in config.py
 MIN_RR         = 1.5
 MAX_RR_CAP     = 8.0   # cap TP at 8R so it's reachable within a session
 SL_BUFFER      = 3.0   # pip buffer beyond FVG edge for SL  (was 2.0 -- raised to reduce false SL hits)
@@ -127,8 +131,9 @@ class BacktestTrade:
     h4_bias:       str              = ""
     entry_type:    str              = "FVG_ENTRY"   # "FVG_ENTRY" | "OB_ENTRY" | "MSS_ENTRY"
     be_triggered:  bool             = False
-    vwap:          float            = 0.0    # session VWAP at trade entry
-    vwap_aligned:  bool             = True   # True when entry is between VWAP and TP
+    vwap:              float = 0.0    # session VWAP at trade entry
+    vwap_aligned:      bool  = True   # True when entry is in discount/premium zone for direction
+    vwap_lot_modifier: float = 1.0   # 1.0 normal | 0.75 overextended (>2x ATR from VWAP)
     entry_ts_utc:  object           = None   # pd.Timestamp -- not in CSV output
 
 
@@ -233,6 +238,28 @@ def _h4_sma_at(h4_df: pd.DataFrame, as_of: pd.Timestamp, period: int) -> float:
     return float(closes.mean())
 
 
+def _m5_atr_at(m5_df: pd.DataFrame, as_of: pd.Timestamp, period: int = 14) -> float:
+    """
+    Compute `period`-bar ATR from M5 candles strictly before as_of.
+    Uses simple average of True Range (not Wilder's smoothing).
+    Returns 0.0 when there is insufficient history.
+    """
+    mask = m5_df.index < as_of
+    sub  = m5_df[mask].iloc[-(period + 1):]
+    if len(sub) < period + 1:
+        return 0.0
+    highs  = sub["high"].values
+    lows   = sub["low"].values
+    closes = sub["close"].values
+    trs = [
+        max(highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i]  - closes[i - 1]))
+        for i in range(1, len(sub))
+    ]
+    return round(float(np.mean(trs[-period:])), 5)
+
+
 def _session_vwap_at(
     m5_df: pd.DataFrame,
     as_of: pd.Timestamp,
@@ -323,11 +350,13 @@ def _simulate_trade(
     sl:         float,
     tp:         float,
     lot:        float,
-    pip_val:    float = 10.0,   # $10 per pip per lot for XAUUSD
+    pip_val:    float = 10.0,     # $10 per pip per lot for XAUUSD
+    be_trigger: float = BE_TRIGGER,
 ) -> tuple[float, float, str, int]:
     """
     Walk forward from entry_idx and return (exit_price, pnl, reason, duration_m).
-    Simulates breakeven at BE_TRIGGER.
+    Simulates breakeven at be_trigger (fraction of way to TP).
+    Pass be_trigger > 1.0 to disable BE entirely.
     Closes at end of day if neither SL nor TP is hit.
     """
     effective_sl = sl
@@ -353,7 +382,7 @@ def _simulate_trade(
         if not be_set:
             tp_dist  = abs(tp - entry)
             progress = abs(close - entry) / tp_dist if tp_dist > 0 else 0
-            if progress >= BE_TRIGGER:
+            if progress >= be_trigger:
                 effective_sl = entry
                 be_set = True
 
@@ -401,11 +430,12 @@ STAGE_ORDER = [
     "SHORT_ABOVE_50SMA",           #  7 - SHORT skipped: price is above 50-period H4 SMA
     "LONG_BELOW_50SMA",            #  8 - LONG skipped: price is below 50-period H4 SMA
     "NO_SWEEP",                    #  9 - no liquidity sweep found
-    "NO_MSS",                      # 10 - sweep found, but no MSS
-    "NO_FVG",                      # 11 - MSS found, but no valid FVG
-    "WRONG_ZONE",                  # 12 - FVG exists but in wrong premium/discount zone
-    "LOW_RR",                      # 13 - zone OK but reward:risk below minimum
-    "TRADE",                       # 14 - setup complete, trade taken
+    "NO_MSS",                      # 10 - sweep found, but no MSS (quality filters applied)
+    "NO_RETRACE",                  # 11 - MSS found, but price didn't retrace ≥ 20%
+    "NO_FVG",                      # 12 - retrace OK but no valid FVG (size/freshness/zone)
+    "WRONG_ZONE",                  # 13 - FVG exists but in wrong premium/discount zone
+    "LOW_RR",                      # 14 - zone OK but reward:risk below minimum
+    "TRADE",                       # 15 - setup complete, trade taken
 ]
 _STAGE_RANK = {s: i for i, s in enumerate(STAGE_ORDER)}
 
@@ -457,17 +487,55 @@ def _scan_for_entry_verbose(
                 diagnose_sweep_miss(sub, level, sweep_dir, MIN_WICK_PIPS, label=_label)
         return None, "NO_SWEEP"
 
-    mss = detect_market_structure_shift(sub, direction, after_idx=sweep_res.candle_index)
+    # MSS with quality filters: body ratio ≥ 60%, break ≥ 3 pips
+    mss = detect_market_structure_shift(
+        sub, direction, after_idx=sweep_res.candle_index,
+        min_break_pips=MIN_MSS_BREAK_PIPS,
+        min_body_ratio=MIN_MSS_BODY_RATIO,
+    )
+    if not mss.found:
+        # Strong sweep: wick > STRONG_SWEEP_PIPS beyond the level gives extra
+        # institutional confirmation, so relax the MSS body-ratio requirement.
+        sweep_depth = abs(sweep_res.sweep_price - sweep_lvl) / PIP_VALUE
+        if sweep_depth > STRONG_SWEEP_PIPS:
+            mss = detect_market_structure_shift(
+                sub, direction, after_idx=sweep_res.candle_index,
+                min_break_pips=MIN_MSS_BREAK_PIPS,
+                min_body_ratio=STRONG_SWEEP_MSS_BODY_RATIO,
+            )
     if not mss.found:
         return None, "NO_MSS"
 
-    fvg = detect_fvg(sub, direction, start_idx=sweep_res.candle_index)
+    # Retrace check: price must pull back ≥ 20% of the MSS impulse
+    if not check_mss_retrace(
+        sub, mss.candle_index, mss.break_price,
+        sweep_res.sweep_price, direction,
+        min_pct=MIN_RETRACE_PCT,
+    ):
+        return None, "NO_RETRACE"
+
+    # FVG with quality filters: ≥ 3 pips, within ±5 candles of MSS,
+    # in discount/premium zone, closest to current price when multiple exist.
+    cur_price_at_scan = float(sub.iloc[-1]["close"])
+    fvg = detect_fvg(
+        sub, direction,
+        start_idx=sweep_res.candle_index,
+        mss_idx=mss.candle_index,
+        min_pips=MIN_FVG_PIPS,
+        current_price=cur_price_at_scan,
+        swing_high=pdh,
+        swing_low=pdl,
+    )
 
     # -- When no clean FVG: try Method A (Order Block) then Method B (MSS candle) --
+    # OB quality: ≥ 5 pips body, last opposing candle before MSS, untested.
     if fvg is None or fvg.filled:
-        ob = detect_order_block(sub, direction,
-                                sweep_idx=sweep_res.candle_index,
-                                mss_idx=mss.candle_index)
+        ob = detect_order_block(
+            sub, direction,
+            sweep_idx=sweep_res.candle_index,
+            mss_idx=mss.candle_index,
+            min_ob_pips=MIN_OB_PIPS,
+        )
         fallback = ob if ob.found else detect_mss_candle_entry(sub, mss.candle_index)
 
         if fallback.found:
@@ -502,9 +570,9 @@ def _scan_for_entry_verbose(
 
         return None, "NO_FVG"
 
-    if ZONE_FILTER and pdh > 0 and pdl > 0:
-        if not is_fvg_in_correct_zone(fvg, pdh, pdl, direction):
-            return None, "WRONG_ZONE"
+    # Zone check is now integrated into detect_fvg() via swing_high/swing_low.
+    # WRONG_ZONE stage is kept in STAGE_ORDER for legacy session data but will
+    # not be hit by the improved pipeline.
 
     buf = SL_BUFFER * PIP_VALUE
     if direction == "bullish":
@@ -865,25 +933,37 @@ def run_backtest(
             continue
 
         # --- Session VWAP at entry -------------------------------------------
-        _vwap_sess_hour = _WIN_SESSION_VWAP_START_UTC.get(window, 0)
+        _vwap_sess_hour  = _WIN_SESSION_VWAP_START_UTC.get(window, 0)
         _vwap_sess_start = pd.Timestamp(today, tz=UTC).replace(hour=_vwap_sess_hour, minute=0)
         trade_vwap = _session_vwap_at(m5_df, ts_utc, _vwap_sess_start)
 
-        # VWAP alignment: entry must be between VWAP and TP
-        # LONG:  VWAP < entry < TP   (bullish confirmation)
-        # SHORT: TP   < entry < VWAP (bearish confirmation)
+        # NEW alignment: buying/selling in the correct zone relative to VWAP
+        # LONG  aligned → entry BELOW VWAP (discount zone, institutional buy area)
+        # SHORT aligned → entry ABOVE VWAP (premium zone, institutional sell area)
         if trade_vwap > 0:
             if direction == "bullish":
-                trade_vwap_aligned = entry > trade_vwap
-            else:
                 trade_vwap_aligned = entry < trade_vwap
+            else:
+                trade_vwap_aligned = entry > trade_vwap
         else:
-            trade_vwap_aligned = True   # VWAP unavailable → don't filter
+            trade_vwap_aligned = True   # VWAP unavailable → don't penalise
+
+        # VWAP distance lot modifier (ATR-based)
+        trade_atr = _m5_atr_at(m5_df, ts_utc, period=14)
+        if trade_vwap > 0 and trade_atr > 0:
+            from bias_combiner import VWAP_OVEREXTENDED_ATR, VWAP_LOT_OVEREXTENDED
+            vwap_dist_atr = abs(entry - trade_vwap) / trade_atr
+            trade_vwap_lot_mod = (
+                VWAP_LOT_OVEREXTENDED if vwap_dist_atr > VWAP_OVEREXTENDED_ATR else 1.0
+            )
+        else:
+            trade_vwap_lot_mod = 1.0
         # ---------------------------------------------------------------------
 
-        # Lot size
+        # Lot size (incorporates VWAP distance modifier)
         sl_pips = abs(entry - sl) / 0.10
-        lot     = calculate_lot_size(balance, RISK_PCT, sl_pips, lot_modifier=1.0)
+        lot     = calculate_lot_size(balance, RISK_PCT, sl_pips,
+                                     lot_modifier=trade_vwap_lot_mod)
 
         trade_counter += 1
         trades_today  += 1
@@ -905,9 +985,10 @@ def run_backtest(
             fvg_bottom   = round(fvg.bottom, 2),
             h4_bias      = h4_bias_label,
             entry_type   = entry_type,
-            vwap         = trade_vwap,
-            vwap_aligned = trade_vwap_aligned,
-            entry_ts_utc = ts_utc,
+            vwap              = trade_vwap,
+            vwap_aligned      = trade_vwap_aligned,
+            vwap_lot_modifier = trade_vwap_lot_mod,
+            entry_ts_utc      = ts_utc,
         )
         in_trade   = True
         open_trade = t
@@ -932,7 +1013,113 @@ def run_backtest(
     equity_rows.append({"date": end_date.date().isoformat(), "balance": round(balance, 2)})
     equity_df = pd.DataFrame(equity_rows).set_index("date")
     log.info("Backtest complete: %d trades  final balance=%.2f", len(trades), balance)
-    return trades, equity_df, session_best
+    return trades, equity_df, session_best, m5_df
+
+
+# --- BE sensitivity analysis -------------------------------------------------
+
+def _be_sensitivity_analysis(
+    trades:    list[BacktestTrade],
+    m5_df:     pd.DataFrame,
+    be_levels: list[float],
+) -> list[dict]:
+    """
+    Re-simulate every trade at each BE trigger level and return per-level stats.
+
+    Original SL is recovered from fvg_bottom/top (which are never mutated).
+    For each level we also run a no-BE simulation (trigger=1.1) to identify
+    BE exits that would have been TP — the "opportunity cost" of early BE.
+
+    Returns a list of dicts, one per be_level in be_levels order.
+    """
+    NO_BE = 1.1   # trigger value high enough never to fire
+
+    # --- pass 0: no-BE outcome for every trade -------------------------------
+    nobe_outcomes: list[str] = []
+    for t in trades:
+        orig_sl = (
+            t.fvg_bottom - SL_BUFFER
+            if t.direction == "LONG"
+            else t.fvg_top + SL_BUFFER
+        )
+        if t.entry_ts_utc is None:
+            nobe_outcomes.append("EOW")
+            continue
+        idx = m5_df.index.searchsorted(t.entry_ts_utc)
+        if idx >= len(m5_df) - 1:
+            nobe_outcomes.append("EOW")
+            continue
+        _, _, reason, _ = _simulate_trade(
+            m5_df, idx, t.direction,
+            t.entry, orig_sl, t.tp, t.lot,
+            be_trigger=NO_BE,
+        )
+        nobe_outcomes.append(reason)
+
+    # --- pass 1+: one pass per BE level --------------------------------------
+    results: list[dict] = []
+    for be in be_levels:
+        pnls: list[float]  = []
+        exits: list[str]   = []
+        be_then_tp         = 0
+
+        for i, t in enumerate(trades):
+            orig_sl = (
+                t.fvg_bottom - SL_BUFFER
+                if t.direction == "LONG"
+                else t.fvg_top + SL_BUFFER
+            )
+            if t.entry_ts_utc is None or m5_df.index.searchsorted(t.entry_ts_utc) >= len(m5_df) - 1:
+                pnls.append(t.pnl)
+                exits.append(t.exit_reason)
+                continue
+
+            idx = m5_df.index.searchsorted(t.entry_ts_utc)
+            _, pnl, reason, _ = _simulate_trade(
+                m5_df, idx, t.direction,
+                t.entry, orig_sl, t.tp, t.lot,
+                be_trigger=be,
+            )
+            pnls.append(pnl)
+            exits.append(reason)
+            if reason == "BE" and nobe_outcomes[i] == "TP":
+                be_then_tp += 1
+
+        be_count  = exits.count("BE")
+        wins      = sum(1 for p in pnls if p > 0.01)
+        losses    = sum(1 for p in pnls if p < -0.01)
+        bes       = sum(1 for p in pnls if abs(p) <= 0.01)
+        total     = len(pnls)
+        win_rate  = round(wins / total * 100, 1) if total else 0.0
+        dir_wr    = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0.0
+        net_pnl   = round(sum(pnls), 2)
+
+        # Max intra-run drawdown (dollar-based, chronological)
+        cum  = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for p in pnls:
+            cum += p
+            if cum > peak:
+                peak = cum
+            dd = peak - cum
+            if dd > max_dd:
+                max_dd = dd
+
+        results.append({
+            "be_trigger":  be,
+            "be_count":    be_count,
+            "be_then_tp":  be_then_tp,
+            "wins":        wins,
+            "losses":      losses,
+            "bes":         bes,
+            "win_rate":    win_rate,
+            "dir_wr":      dir_wr,
+            "net_pnl":     net_pnl,
+            "max_dd":      round(max_dd, 2),
+        })
+
+    return results
 
 
 # --- Statistics --------------------------------------------------------------
@@ -962,6 +1149,7 @@ def _compute_session_report(session_best: dict) -> dict:
         "skip_long_below_50sma":        counts["LONG_BELOW_50SMA"],
         "skip_no_sweep":                counts["NO_SWEEP"],
         "skip_no_mss":                  counts["NO_MSS"],
+        "skip_no_retrace":              counts["NO_RETRACE"],
         "skip_no_fvg":                  counts["NO_FVG"],
         "skip_wrong_zone":              counts["WRONG_ZONE"],
         "skip_low_rr":                  counts["LOW_RR"],
@@ -1122,9 +1310,9 @@ def _compute_vwap_comparison(trades: list[BacktestTrade]) -> dict:
     """
     Compare performance with vs. without VWAP alignment filter.
 
-    VWAP-aligned: entry is between session VWAP and TP target
-      LONG  → entry > VWAP  (bullish confirmation)
-      SHORT → entry < VWAP  (bearish confirmation)
+    VWAP-aligned (new ICT logic):
+      LONG  → entry BELOW VWAP  (discount zone, institutional buy area)
+      SHORT → entry ABOVE VWAP  (premium zone, institutional sell area)
 
     Returns a dict with side-by-side stats for the report.
     """
@@ -1151,6 +1339,317 @@ def _compute_vwap_comparison(trades: list[BacktestTrade]) -> dict:
         "not_aligned": _quick_stats(not_aligned),
         "no_vwap":     len(no_vwap),
     }
+
+
+# --- Monte Carlo simulation --------------------------------------------------
+
+def _run_monte_carlo(
+    pnls:             list[float],
+    n_sims:           int   = 10_000,
+    starting_balance: float = ACCOUNT_SIZE,
+    ruin_dd_pct:      float = 50.0,
+) -> dict:
+    """
+    Vectorised Monte Carlo: shuffle trade order n_sims times, record the full
+    equity path, max drawdown, and final balance for each run.
+
+    Uses numpy for speed — 10 k sims on 26 trades runs in < 1 second.
+
+    Returns a dict containing:
+      equity_matrix  ndarray (n_sims, n_trades+1)  — one equity curve per sim
+      pct_curves     dict {5,25,50,75,95} → ndarray — percentile fan curves
+      … aggregated statistics …
+    """
+    rng   = np.random.default_rng(seed=42)   # reproducible
+    pnl_a = np.array(pnls, dtype=float)
+    n     = len(pnl_a)
+
+    # Shuffle all simulations in one vectorised shot
+    idx       = np.argsort(rng.random((n_sims, n)), axis=1)
+    shuffled  = pnl_a[idx]                                    # (n_sims, n)
+
+    # Equity curves: prepend starting balance as column 0
+    cum       = np.cumsum(shuffled, axis=1) + starting_balance
+    eq_matrix = np.hstack([np.full((n_sims, 1), starting_balance), cum])
+
+    # Max drawdown per simulation (% from peak)
+    running_peak = np.maximum.accumulate(eq_matrix, axis=1)
+    # Guard against zero (shouldn't happen with ACCOUNT_SIZE > 0)
+    safe_peak    = np.where(running_peak > 0, running_peak, 1.0)
+    dd_pct_mat   = (running_peak - eq_matrix) / safe_peak * 100.0
+    max_dd       = dd_pct_mat.max(axis=1)                     # (n_sims,)
+
+    final = eq_matrix[:, -1]
+
+    pct_curves = {p: np.percentile(eq_matrix, p, axis=0) for p in (5, 25, 50, 75, 95)}
+
+    return {
+        "n_sims":           n_sims,
+        "n_trades":         n,
+        "starting_balance": starting_balance,
+        "equity_matrix":    eq_matrix,
+        "pct_curves":       pct_curves,
+        # Final balance distribution
+        "median_final":  float(np.percentile(final, 50)),
+        "p5_final":      float(np.percentile(final,  5)),
+        "p25_final":     float(np.percentile(final, 25)),
+        "p75_final":     float(np.percentile(final, 75)),
+        "p95_final":     float(np.percentile(final, 95)),
+        # Drawdown statistics
+        "median_max_dd": float(np.percentile(max_dd, 50)),
+        "p95_max_dd":    float(np.percentile(max_dd, 95)),   # worst-5% scenario
+        "prob_dd_10":    float(np.mean(max_dd > 10.0)),
+        "prob_dd_20":    float(np.mean(max_dd > 20.0)),
+        "prob_ruin":     float(np.mean(max_dd > ruin_dd_pct)),
+        "ruin_count":    int(np.sum(max_dd > ruin_dd_pct)),
+    }
+
+
+def _mc_risk_analysis(
+    pnls:             list[float],
+    risk_levels:      list[float],
+    base_risk_pct:    float = RISK_PCT,
+    n_sims:           int   = 3_000,
+    starting_balance: float = ACCOUNT_SIZE,
+) -> tuple[list[dict], Optional[float]]:
+    """
+    Re-scale PnLs to different risk percentages and run a lighter Monte Carlo
+    (3 k sims) at each level to find the highest risk where P(DD>20%) < 5%.
+
+    Scaling assumption: lot size is proportional to risk %, so all PnLs scale
+    linearly.  This is accurate under fixed-fractional sizing without compounding.
+
+    Returns (results_list, recommended_risk_pct).
+    """
+    results: list[dict] = []
+    rec: Optional[float] = None
+
+    for r in sorted(risk_levels, reverse=True):
+        scale  = r / base_risk_pct
+        scaled = [p * scale for p in pnls]
+        mc     = _run_monte_carlo(scaled, n_sims=n_sims, starting_balance=starting_balance)
+        results.append({"risk_pct": r, **{k: mc[k] for k in
+            ("median_final", "p5_final", "p95_final",
+             "median_max_dd", "p95_max_dd",
+             "prob_dd_10", "prob_dd_20", "prob_ruin")}})
+        # Highest level that still keeps P(DD>20%) < 5 %
+        if mc["prob_dd_20"] < 0.05 and rec is None:
+            rec = r
+
+    return results, rec
+
+
+def _plot_mc_equity(mc: dict, img_path: Path) -> bool:
+    """
+    Draw the equity fan chart with four shaded percentile bands.
+    Returns True on success, False when matplotlib is unavailable.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")           # non-interactive backend (no display needed)
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+    except ImportError:
+        log.warning("matplotlib not installed — Monte Carlo plot skipped")
+        return False
+
+    curves = mc["pct_curves"]
+    x      = np.arange(mc["n_trades"] + 1)
+    start  = mc["starting_balance"]
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    BG = "#0d1117"
+    ax.set_facecolor(BG)
+    fig.patch.set_facecolor(BG)
+
+    # --- Shaded bands (bottom to top) ----------------------------------------
+    # Below 5th %ile — dark red danger zone
+    floor = min(curves[5].min(), start * 0.40) - start * 0.01
+    ax.fill_between(x, floor,      curves[5],  color="#7f0000", alpha=0.60,
+                    label="Below 5th %ile  (danger)")
+    # 5th–25th %ile — red
+    ax.fill_between(x, curves[5],  curves[25], color="#e53935", alpha=0.40,
+                    label="5th–25th %ile")
+    # 25th–75th %ile — amber
+    ax.fill_between(x, curves[25], curves[75], color="#fdd835", alpha=0.35,
+                    label="25th–75th %ile  (IQR)")
+    # 75th–95th %ile — green
+    ax.fill_between(x, curves[75], curves[95], color="#43a047", alpha=0.40,
+                    label="75th–95th %ile")
+
+    # --- Percentile lines ----------------------------------------------------
+    ax.plot(x, curves[50], color="white",   lw=2.0, label="Median",      zorder=5)
+    ax.plot(x, curves[95], color="#66bb6a", lw=0.9, linestyle="--",      zorder=4)
+    ax.plot(x, curves[ 5], color="#ef5350", lw=0.9, linestyle="--",      zorder=4)
+
+    # --- Reference lines -----------------------------------------------------
+    ax.axhline(start,         color="#78909c", lw=0.9, linestyle=":",
+               label=f"Start ${start:,.0f}")
+    danger_line = start * 0.80
+    ax.axhline(danger_line,   color="#ff1744", lw=1.1, linestyle="--",
+               label=f"20% DD (${danger_line:,.0f})")
+    ruin_line   = start * 0.50
+    ax.axhline(ruin_line,     color="#b71c1c", lw=0.8, linestyle=":",
+               label=f"Ruin 50% (${ruin_line:,.0f})")
+
+    # --- Labels & formatting -------------------------------------------------
+    ax.set_xlim(0, mc["n_trades"])
+    ax.set_xlabel("Trade sequence #", color="#cfd8dc", fontsize=10)
+    ax.set_ylabel("Account balance ($)", color="#cfd8dc", fontsize=10)
+    ax.set_title(
+        f"Monte Carlo Equity Distribution  —  {mc['n_sims']:,} simulations  "
+        f"x  {mc['n_trades']} trades",
+        color="white", fontsize=12, pad=10,
+    )
+    ax.tick_params(colors="#cfd8dc", labelsize=8)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"${v:,.0f}"))
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#37474f")
+
+    legend = ax.legend(
+        loc="upper left", facecolor="#161b22", edgecolor="#37474f",
+        labelcolor="#cfd8dc", fontsize=7.5, framealpha=0.90,
+    )
+
+    # Stats annotation (bottom-right)
+    p20 = mc["prob_dd_20"] * 100
+    ann_color = "#ef5350" if p20 >= 5 else "#66bb6a"
+    ax.text(
+        0.985, 0.04,
+        f"P(DD > 10%) = {mc['prob_dd_10']*100:.1f}%\n"
+        f"P(DD > 20%) = {p20:.1f}%\n"
+        f"P(Ruin 50%) = {mc['prob_ruin']*100:.1f}%\n"
+        f"Median final = ${mc['median_final']:,.0f}\n"
+        f"Worst-5% DD  = {mc['p95_max_dd']:.1f}%",
+        transform=ax.transAxes, ha="right", va="bottom",
+        color=ann_color, fontsize=8,
+        bbox=dict(facecolor="#161b22", edgecolor="#37474f", alpha=0.92, pad=5),
+    )
+
+    plt.tight_layout(pad=1.2)
+    plt.savefig(img_path, dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    log.info("Monte Carlo chart: %s", img_path)
+    return True
+
+
+def _format_mc_report(
+    mc:         dict,
+    risk_rows:  list[dict],
+    rec_risk:   Optional[float],
+    trades:     list[BacktestTrade],
+    img_path:   Optional[Path],
+    start_dt:   datetime,
+    end_dt:     datetime,
+) -> str:
+    """Build the Obsidian markdown report for the Monte Carlo analysis."""
+
+    def _pct(v: float) -> str:
+        return f"{v * 100:.1f}%"
+
+    img_embed = (
+        f"![[{img_path.name}]]" if img_path else "_Chart not generated (matplotlib missing)_"
+    )
+
+    rec_note = (
+        f"**{rec_risk:.2f}%** — highest risk level where P(DD>20%) < 5 %"
+        if rec_risk is not None
+        else "**< 0.25%** — even the lowest tested level exceeds the 5% safety threshold"
+    )
+    safe_flag = (
+        "[OK] 1% risk is within the safe threshold."
+        if mc["prob_dd_20"] < 0.05
+        else "[WARN] 1% risk exceeds the 5% safety threshold — consider reducing."
+    )
+
+    # Risk table
+    risk_header = (
+        "| Risk % | Med. Final | 5th Pct | 95th Pct | Med DD | Worst-5% DD "
+        "| P(DD>10%) | P(DD>20%) | P(Ruin) |\n"
+        "|--------|-----------|---------|---------|--------|------------|"
+        "-----------|-----------|--------|\n"
+    )
+    risk_body = ""
+    for r in risk_rows:
+        marker = " **<--**" if r["risk_pct"] == rec_risk else ""
+        risk_body += (
+            f"| {r['risk_pct']:.2f}% | ${r['median_final']:,.0f} "
+            f"| ${r['p5_final']:,.0f} | ${r['p95_final']:,.0f} "
+            f"| {r['median_max_dd']:.1f}% | {r['p95_max_dd']:.1f}% "
+            f"| {_pct(r['prob_dd_10'])} | {_pct(r['prob_dd_20'])} "
+            f"| {_pct(r['prob_ruin'])} |{marker}\n"
+        )
+
+    return f"""\
+---
+type: monte-carlo
+symbol: XAUUSD
+strategy: Silver Bullet (ICT)
+period: {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}
+generated: {datetime.now(NPT).strftime('%Y-%m-%d %H:%M NPT')}
+n_simulations: {mc['n_sims']:,}
+n_trades: {mc['n_trades']}
+---
+
+# Monte Carlo Analysis -- XAUUSD Silver Bullet
+
+**Period:** {start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}
+**Simulations:** {mc['n_sims']:,}  |  **Trades per sim:** {mc['n_trades']}
+**Seed:** 42 (reproducible)
+
+---
+
+## Equity Distribution
+
+{img_embed}
+
+---
+
+## Summary Statistics  (1% risk, {mc['n_sims']:,} runs)
+
+| Metric | Value |
+|--------|-------|
+| Starting balance | ${mc['starting_balance']:,.0f} |
+| Median final balance | ${mc['median_final']:,.0f} |
+| 5th percentile (worst 5%) | ${mc['p5_final']:,.0f} |
+| 25th percentile | ${mc['p25_final']:,.0f} |
+| 75th percentile | ${mc['p75_final']:,.0f} |
+| 95th percentile (best 5%) | ${mc['p95_final']:,.0f} |
+| Median max drawdown | {mc['median_max_dd']:.1f}% |
+| Worst-5% max drawdown | {mc['p95_max_dd']:.1f}% |
+| **P(DD > 10%)** | **{_pct(mc['prob_dd_10'])}** |
+| **P(DD > 20%)** | **{_pct(mc['prob_dd_20'])}** |
+| **P(Ruin > 50%)** | **{_pct(mc['prob_ruin'])}** |
+| Ruin events (/{mc['n_sims']:,}) | {mc['ruin_count']} |
+
+{safe_flag}
+
+---
+
+## Risk Sensitivity  (scaled from {RISK_PCT}% base, 3,000 sims each)
+
+{risk_header}{risk_body}
+**Recommendation:** {rec_note}
+
+---
+
+## Interpretation
+
+- The **IQR band (25th–75th %ile)** shows where the middle 50% of all simulations
+  land — this is the realistic range of outcomes given random trade sequencing.
+- A wide spread between the 5th and 95th percentile curves indicates high
+  sequence-of-returns risk even when the overall edge is positive.
+- P(DD>20%) is the primary safety metric.  ICT practitioners typically treat
+  20% drawdown as a "strategy review" trigger.
+- Ruin (>50% DD) probability above 1% is considered unacceptable for live trading.
+
+---
+
+## Tags
+
+#monte-carlo #risk-analysis #xauusd #silver-bullet #ict
+"""
 
 
 # --- Output writers ----------------------------------------------------------
@@ -1279,8 +1778,9 @@ generated: {datetime.now(NPT).strftime('%Y-%m-%d %H:%M NPT')}
 + f"| SHORT blocked: price above 50 SMA | {session_report['skip_short_above_50sma']} |\\n"
 + f"| LONG blocked: price below 50 SMA | {session_report['skip_long_below_50sma']} |\\n"
 + f"| No liquidity sweep | {session_report['skip_no_sweep']} |\\n"
-+ f"| Sweep found, no MSS | {session_report['skip_no_mss']} |\\n"
-+ f"| MSS found, no FVG | {session_report['skip_no_fvg']} |\\n"
++ f"| Sweep found, no MSS (quality) | {session_report['skip_no_mss']} |\\n"
++ f"| MSS found, no retrace >=20% | {session_report['skip_no_retrace']} |\\n"
++ f"| Retrace OK, no FVG (quality) | {session_report['skip_no_fvg']} |\\n"
 + f"| FVG in wrong zone | {session_report['skip_wrong_zone']} |\\n"
 + f"| RR below minimum | {session_report['skip_low_rr']} |\\n"
 + f"| **Trades taken** | **{session_report['sessions_traded']}** |\\n"
@@ -1293,7 +1793,8 @@ generated: {datetime.now(NPT).strftime('%Y-%m-%d %H:%M NPT')}
 ## VWAP Filter Comparison
 
 Session VWAP resets at each session open (Asian 00:00 UTC, London 07:00 UTC, NY 12:00 UTC).
-VWAP-aligned = FVG entry is between session VWAP and TP target.
+VWAP-aligned = LONG entry below VWAP (discount zone) / SHORT entry above VWAP (premium zone).
+Lot modifier: 0.75x when price is >2x ATR from VWAP (overextended), otherwise 1.0x.
 
 {"_VWAP data not available._" if not vwap_cmp else (
 "| Metric | All Trades | VWAP-Aligned | Not Aligned |\\n"
@@ -1317,7 +1818,7 @@ VWAP-aligned = FVG entry is between session VWAP and TP target.
 - Account: ${ACCOUNT_SIZE:,.0f} starting balance, {RISK_PCT}% risk per trade
 - Sessions traded: Asian Sweep (12:45-13:45 NPT), London Open (13:45-14:45 NPT), NY AM (19:45-20:45 NPT), NY PM (23:45-00:45 NPT)
 - Breakeven triggered at {int(BE_TRIGGER*100)}% of way to TP
-- VWAP: session VWAP computed from M5 candles; resets at Asian/London/NY session open
+- VWAP: session VWAP from M5 candles; LONG aligned=below VWAP, SHORT aligned=above VWAP; lot 0.75x when >2x ATR from VWAP
 - News filter NOT applied in backtest (conservative: would reduce trades)
 - High-risk days (Mon/Fri) NOT filtered in backtest
 
@@ -1362,7 +1863,7 @@ if __name__ == "__main__":
         end_dt   = datetime(2026, 4, 11, tzinfo=UTC)
         start_dt = end_dt - timedelta(days=30 * months)
 
-        trades, equity_df, session_best = run_backtest(months, start_dt, end_dt)
+        trades, equity_df, session_best, m5_df_bt = run_backtest(months, start_dt, end_dt)
 
         if not trades:
             print("\n  No trades generated in this period.")
@@ -1440,15 +1941,16 @@ if __name__ == "__main__":
 
             # All trades table
             print(f"\n  All trades ({stats['total_trades']} total):")
-            print(f"  {'#':<4} {'Date':<12} {'Dir':<6} {'Entry':>8} {'Exit':>8} {'PnL':>9} {'Reason':<6} {'RR':>5}  {'VWAP':>8} {'Align':<6} Window")
+            print(f"  {'#':<4} {'Date':<12} {'Dir':<6} {'Entry':>8} {'Exit':>8} {'PnL':>9} {'Reason':<6} {'RR':>5}  {'VWAP':>8} {'Align':<5} {'LotMod':>6} Window")
             for t in trades:
                 win_marker = " *" if t.pnl > 0.01 else ("  " if abs(t.pnl) <= 0.01 else "  ")
                 vwap_str  = f"{t.vwap:>8.2f}" if t.vwap > 0 else "       -"
                 align_str = "YES" if t.vwap_aligned else "NO "
+                lot_mod_str = f"{t.vwap_lot_modifier:.2f}x"
                 print(f"  {t.trade_id:<4} {t.date:<12} {t.direction:<6} "
                       f"{t.entry:>8.2f} {t.exit_price:>8.2f} "
                       f"${t.pnl:>+8.2f} {t.exit_reason:<6} 1:{t.rr_achieved:.1f}"
-                      f"  {vwap_str} {align_str}   {t.window}{win_marker}")
+                      f"  {vwap_str} {align_str:<5} {lot_mod_str:>6}  {t.window}{win_marker}")
 
             # VWAP comparison
             vwap_cmp = _compute_vwap_comparison(trades)
@@ -1457,7 +1959,7 @@ if __name__ == "__main__":
             vc_na = vwap_cmp['not_aligned']
             print(f"\n{'=' * 60}")
             print(f"  VWAP FILTER COMPARISON")
-            print(f"  (aligned = FVG entry between session VWAP and TP)")
+            print(f"  (aligned = LONG below VWAP [discount] / SHORT above VWAP [premium])")
             print(f"{'=' * 60}")
             print(f"  {'Metric':<22} {'All':>10}  {'VWAP-Aligned':>12}  {'Not Aligned':>11}")
             print(f"  {'-'*22} {'-'*10}  {'-'*12}  {'-'*11}")
@@ -1492,7 +1994,8 @@ if __name__ == "__main__":
             print(f"  LONG:  price < 50 SMA     : {sr['skip_long_below_50sma']}")
             print(f"  -- No liquidity sweep     : {sr['skip_no_sweep']}")
             print(f"  -- Sweep found, no MSS    : {sr['skip_no_mss']}")
-            print(f"  -- MSS found, no FVG      : {sr['skip_no_fvg']}")
+            print(f"  -- MSS: no retrace >=20%   : {sr['skip_no_retrace']}")
+            print(f"  -- MSS OK, no FVG         : {sr['skip_no_fvg']}")
             print(f"  -- FVG wrong zone         : {sr['skip_wrong_zone']}")
             print(f"  -- RR too low             : {sr['skip_low_rr']}")
             print(f"  ----------------------------------------")
@@ -1500,8 +2003,179 @@ if __name__ == "__main__":
             print(f"  Session -> trade rate     : {conv:.1f}%")
             print(f"{'=' * 60}")
 
+            # --- BE trigger sensitivity analysis -----------------------------
+            BE_LEVELS = [0.33, 0.50, 0.618]
+            be_rows = _be_sensitivity_analysis(trades, m5_df_bt, BE_LEVELS)
+
+            # Also compute a no-BE baseline for P&L delta context
+            be_no  = _be_sensitivity_analysis(trades, m5_df_bt, [1.1])[0]
+
+            # Scoring: weight Dir WR 40%, P&L 40%, max-DD-reduction 20%
+            # Normalise each metric so they're comparable across levels
+            dir_wrs  = [r["dir_wr"]  for r in be_rows]
+            net_pnls = [r["net_pnl"] for r in be_rows]
+            max_dds  = [r["max_dd"]  for r in be_rows]
+            def _norm_hi(vals, v):   # higher is better
+                lo, hi = min(vals), max(vals)
+                return (v - lo) / (hi - lo) if hi > lo else 0.5
+            def _norm_lo(vals, v):   # lower is better
+                lo, hi = min(vals), max(vals)
+                return (hi - v) / (hi - lo) if hi > lo else 0.5
+            scores = []
+            for r in be_rows:
+                s = (0.40 * _norm_hi(dir_wrs, r["dir_wr"])
+                   + 0.40 * _norm_hi(net_pnls, r["net_pnl"])
+                   + 0.20 * _norm_lo(max_dds,  r["max_dd"]))
+                scores.append(s)
+            best_idx = scores.index(max(scores))
+            best_be  = be_rows[best_idx]
+
+            W = 62   # console table width
+            print(f"\n{'=' * W}")
+            print(f"  BREAKEVEN TRIGGER SENSITIVITY  (current = {int(BE_TRIGGER*100)}%)")
+            print(f"  No-BE baseline: {be_no['wins']}W / {be_no['losses']}L  "
+                  f"Dir WR {be_no['dir_wr']}%  Net ${be_no['net_pnl']:+,.2f}")
+            print(f"{'=' * W}")
+            hdr  = f"  {'Metric':<26}"
+            for r in be_rows:
+                lbl = f"{int(r['be_trigger']*100)}%" if r['be_trigger'] < 1 else f"{r['be_trigger']*100:.1f}%"
+                hdr += f"  {lbl:>10}"
+            print(hdr)
+            print(f"  {'-'*26}" + "  ----------" * len(be_rows))
+
+            def _row(label, fmt, key):
+                line = f"  {label:<26}"
+                for r in be_rows:
+                    line += f"  {fmt.format(r[key]):>10}"
+                print(line)
+
+            _row("BE exits (total)",      "{:d}",    "be_count")
+            _row("  -> would have hit TP","{:d}",    "be_then_tp")
+            _row("Wins",                  "{:d}",    "wins")
+            _row("Losses",                "{:d}",    "losses")
+            _row("Breakevens",            "{:d}",    "bes")
+            _row("Win Rate",              "{:.1f}%", "win_rate")
+            _row("Dir WR (excl BE)",      "{:.1f}%", "dir_wr")
+            _row("Net P&L ($)",           "{:+,.0f}", "net_pnl")
+            _row("Max DD ($)",            "{:,.0f}",  "max_dd")
+
+            print(f"  {'-'*26}" + "  ----------" * len(be_rows))
+            score_line = f"  {'Composite score':<26}"
+            for i, s in enumerate(scores):
+                marker = " *" if i == best_idx else "  "
+                score_line += f"  {s:.3f}{marker:>6}"
+            print(score_line)
+            print(f"{'=' * W}")
+
+            # Recommendation with reasoning
+            pnl_delta = round(best_be["net_pnl"] - be_no["net_pnl"], 2)
+            print(f"\n  RECOMMENDATION: BE at {int(best_be['be_trigger']*100)}%")
+            print(f"  --------------------------------------------------------")
+            print(f"  Dir WR : {best_be['dir_wr']}%  (no-BE baseline: {be_no['dir_wr']}%)")
+            print(f"  Net P&L: ${best_be['net_pnl']:+,.2f}  ({pnl_delta:+,.2f} vs no-BE)")
+            print(f"  Max DD : ${best_be['max_dd']:,.2f}")
+            print(f"  BE exits that would have continued to TP: {best_be['be_then_tp']}")
+            if best_be["be_then_tp"] > 0:
+                pct_lost = round(best_be["be_then_tp"] / best_be["be_count"] * 100, 0) if best_be["be_count"] > 0 else 0
+                print(f"  ({int(pct_lost)}% of BE exits were prematurely stopped)")
+            print(f"{'=' * W}")
+            # ----------------------------------------------------------------
+
+            # --- Monte Carlo simulation --------------------------------------
+            ts_str = datetime.now().strftime("%Y%m%d_%H%M")
+
+            pnls = [t.pnl for t in trades]
+            print(f"\n{'=' * W}")
+            print(f"  MONTE CARLO SIMULATION  (10,000 runs x {len(pnls)} trades)")
+            print(f"{'=' * W}")
+            print(f"  Running... ", end="", flush=True)
+
+            mc = _run_monte_carlo(pnls, n_sims=10_000)
+            print("done.")
+
+            # Console summary table
+            print(f"  {'Metric':<32}  {'Value':>14}")
+            print(f"  {'-'*32}  {'-'*14}")
+            print(f"  {'Starting balance':<32}  ${mc['starting_balance']:>13,.0f}")
+            print(f"  {'Median final balance':<32}  ${mc['median_final']:>13,.0f}")
+            print(f"  {'5th percentile  (worst 5%)':<32}  ${mc['p5_final']:>13,.0f}")
+            print(f"  {'25th percentile':<32}  ${mc['p25_final']:>13,.0f}")
+            print(f"  {'75th percentile':<32}  ${mc['p75_final']:>13,.0f}")
+            print(f"  {'95th percentile (best 5%)':<32}  ${mc['p95_final']:>13,.0f}")
+            print(f"  {'Median max drawdown':<32}  {mc['median_max_dd']:>13.1f}%")
+            print(f"  {'Worst-5% max drawdown':<32}  {mc['p95_max_dd']:>13.1f}%")
+            print(f"  {'P(DD > 10%)':<32}  {mc['prob_dd_10']*100:>13.1f}%")
+            print(f"  {'P(DD > 20%)':<32}  {mc['prob_dd_20']*100:>13.1f}%")
+            print(f"  {'P(Ruin > 50%)':<32}  {mc['prob_ruin']*100:>13.1f}%")
+            print(f"  {'Ruin events':<32}  {mc['ruin_count']:>14,}")
+            print(f"{'=' * W}")
+
+            # Risk sensitivity table
+            MC_RISK_LEVELS = [0.25, 0.50, 0.75, 1.0, 1.25, 1.5, 2.0]
+            print(f"\n  Running risk sensitivity ({len(MC_RISK_LEVELS)} levels x 3,000 sims)... ",
+                  end="", flush=True)
+            risk_rows, rec_risk = _mc_risk_analysis(pnls, MC_RISK_LEVELS)
+            print("done.")
+
+            print(f"\n  RISK SENSITIVITY TABLE")
+            print(f"  {'Risk%':>6}  {'Med Final':>10}  {'P5 Final':>10}  "
+                  f"{'Med DD':>7}  {'W5% DD':>7}  {'P(DD>10%)':>10}  {'P(DD>20%)':>10}  {'P(Ruin)':>8}")
+            print(f"  {'------':>6}  {'-'*10}  {'-'*10}  {'-'*7}  {'-'*7}  {'-'*10}  {'-'*10}  {'-'*8}")
+            for r in reversed(risk_rows):   # ascending order for readability
+                marker = " <--" if r["risk_pct"] == rec_risk else ""
+                print(f"  {r['risk_pct']:>5.2f}%  ${r['median_final']:>9,.0f}  "
+                      f"${r['p5_final']:>9,.0f}  {r['median_max_dd']:>6.1f}%  "
+                      f"{r['p95_max_dd']:>6.1f}%  {r['prob_dd_10']*100:>9.1f}%  "
+                      f"{r['prob_dd_20']*100:>9.1f}%  {r['prob_ruin']*100:>7.1f}%{marker}")
+            print(f"{'=' * W}")
+
+            if rec_risk is not None:
+                print(f"\n  RECOMMENDATION: {rec_risk:.2f}% risk per trade")
+                print(f"  (highest level where P(DD>20%) < 5%)")
+            else:
+                print(f"\n  RECOMMENDATION: < 0.25% risk per trade")
+                print(f"  (even the lowest tested level exceeds the 5% safety threshold)")
+            print(f"{'=' * W}")
+
+            # Equity fan chart
+            mc_img_path = OUTPUT_DIR / f"mc_{ts_str}.png"
+            chart_ok = _plot_mc_equity(mc, mc_img_path)
+            if chart_ok:
+                print(f"\n  MC chart   : {mc_img_path}")
+            else:
+                mc_img_path = None
+                print(f"\n  MC chart   : skipped (matplotlib not available)")
+
+            # Save MC markdown report
+            mc_md_path = OUTPUT_DIR / f"mc_{ts_str}.md"
+            mc_md_content = _format_mc_report(
+                mc, risk_rows, rec_risk, trades,
+                mc_img_path, start_dt, end_dt,
+            )
+            mc_md_path.write_text(mc_md_content, encoding="utf-8")
+
+            # Copy MC report + chart to Obsidian
+            try:
+                from obsidian_logger import VAULT_PATH
+                obs_mc = VAULT_PATH / "trades" / "monte-carlo"
+                obs_mc.mkdir(parents=True, exist_ok=True)
+                obs_mc_md = obs_mc / f"mc_{ts_str}.md"
+                obs_mc_md.write_text(mc_md_content, encoding="utf-8")
+                if mc_img_path and mc_img_path.exists():
+                    import shutil
+                    obs_mc_img = obs_mc / mc_img_path.name
+                    shutil.copy2(mc_img_path, obs_mc_img)
+                    print(f"  Obsidian MC: {obs_mc_md}")
+                    print(f"  Obsidian img: {obs_mc_img}")
+                else:
+                    print(f"  Obsidian MC: {obs_mc_md}")
+            except Exception as exc:
+                log.warning("Could not copy MC report to Obsidian: %s", exc)
+
+            print(f"\n  MC report  : {mc_md_path}")
+            # ----------------------------------------------------------------
+
             # Save outputs
-            ts_str   = datetime.now().strftime("%Y%m%d_%H%M")
             csv_path = OUTPUT_DIR / f"backtest_{ts_str}.csv"
             md_path  = OUTPUT_DIR / f"backtest_{ts_str}.md"
 

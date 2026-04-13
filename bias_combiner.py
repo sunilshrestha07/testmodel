@@ -35,8 +35,14 @@ logging.basicConfig(
 W_TECHNICAL           = 0.40
 W_NEWS                = 0.35
 W_DXY                 = 0.25
-W_VWAP                = 0.10   # intraday VWAP confirmation
+W_VWAP_ALIGNED        = 0.15   # bonus when price is in discount/premium zone for direction
+W_VWAP_PENALTY        = 0.10   # penalty when price is in the wrong zone for direction
 DIVERGENCE_MULTIPLIER = 0.30   # collapses score when gold and DXY agree
+
+# VWAP distance lot-size modifiers (distance measured in ATR multiples)
+VWAP_OVEREXTENDED_ATR = 2.0    # >2x ATR from VWAP → reduce lot to 75% (mean-reversion risk)
+VWAP_FRESH_ATR        = 0.5    # <=0.5x ATR from VWAP → full lot (fresh imbalance, clean entry)
+VWAP_LOT_OVEREXTENDED = 0.75   # lot modifier when overextended
 
 # --- Thresholds ---------------------------------------------------------------
 STRONG_THRESHOLD = 0.60
@@ -53,8 +59,8 @@ WINDOW_THRESHOLDS: dict[str, float] = {
 # Maximum score achievable without the news component.
 # Use this as `available_weight` when calling is_score_sufficient() in backtest
 # mode, so thresholds scale proportionally to what is actually computable.
-# VWAP is computable in real-time so it's included here.
-W_MAX_PARTIAL: float = W_TECHNICAL + W_DXY + W_VWAP   # 0.40 + 0.25 + 0.10 = 0.75
+# VWAP is computable in real-time so it's included here (max aligned bonus = +0.15).
+W_MAX_PARTIAL: float = W_TECHNICAL + W_DXY + W_VWAP_ALIGNED   # 0.40 + 0.25 + 0.15 = 0.80
 
 
 # --- Result dataclass ---------------------------------------------------------
@@ -82,9 +88,12 @@ class BiasResult:
     strength:     str    # STRONG / WEAK / NONE
 
     # VWAP (populated after score; defaults allow old callers to work)
-    session_vwap:    float = 0.0
-    vwap_bias:       str   = "NEUTRAL"   # BULLISH / BEARISH / NEUTRAL
-    vwap_session:    str   = ""          # Asian / London / NY
+    session_vwap:      float = 0.0
+    vwap_bias:         str   = "NEUTRAL"   # BULLISH / BEARISH / NEUTRAL
+    vwap_session:      str   = ""          # Asian / London / NY
+    vwap_lot_modifier: float = 1.0         # 1.0 (normal) or 0.75 (overextended >2x ATR)
+    vwap_distance_atr: float = 0.0         # abs(price - vwap) expressed in ATR multiples
+    m5_atr:            float = 0.0         # 14-bar M5 ATR at time of calculation
 
     # Regime & SHORT qualification (populated after score; defaults allow old callers to work)
     current_price:   float = 0.0
@@ -174,16 +183,48 @@ def _get_session_vwap() -> tuple[float, str]:
     return vwap, sess_label
 
 
-def _vwap_to_score(price: float, vwap: float) -> tuple[float, str]:
+def _get_m5_atr(period: int = 14) -> float:
+    """Compute `period`-bar ATR for SYMBOL from live M5 data.
+    Returns 0.0 when MT5 data is unavailable or history is too short."""
+    rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, period + 1)
+    if rates is None or len(rates) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(rates)):
+        high       = float(rates[i]["high"])
+        low        = float(rates[i]["low"])
+        prev_close = float(rates[i - 1]["close"])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    return round(sum(trs[-period:]) / period, 5)
+
+
+def _vwap_to_score(price: float, vwap: float, tentative_direction: str) -> tuple[float, str]:
     """
-    Return (score, bias) based on price position relative to session VWAP.
-    Returns (0.0, 'NEUTRAL') when VWAP is unavailable (0.0).
+    Return (score, bias) based on price zone relative to session VWAP.
+
+    NEW LOGIC (ICT institutional flow):
+      LONG  + price BELOW VWAP → +W_VWAP_ALIGNED (+0.15)  [discount zone, institutional buy]
+      LONG  + price ABOVE VWAP → -W_VWAP_PENALTY (-0.10)  [premium zone, dangerous for longs]
+      SHORT + price ABOVE VWAP → +W_VWAP_ALIGNED (+0.15)  [premium zone, institutional sell]
+      SHORT + price BELOW VWAP → -W_VWAP_PENALTY (-0.10)  [discount zone, dangerous for shorts]
+
+    Returns (0.0, 'NEUTRAL') when VWAP is unavailable or direction is NONE.
     """
-    if vwap <= 0 or price <= 0:
+    if vwap <= 0 or price <= 0 or tentative_direction == "NONE":
         return 0.0, "NEUTRAL"
-    if price > vwap:
-        return W_VWAP, "BULLISH"
-    return -W_VWAP, "BEARISH"
+
+    if tentative_direction == "LONG":
+        if price < vwap:
+            return W_VWAP_ALIGNED, "BULLISH"   # discount zone — ideal long entry
+        return -W_VWAP_PENALTY, "BEARISH"       # premium zone — overextended for longs
+
+    if tentative_direction == "SHORT":
+        if price > vwap:
+            return W_VWAP_ALIGNED, "BEARISH"   # premium zone — ideal short entry
+        return -W_VWAP_PENALTY, "BULLISH"       # discount zone — overextended for shorts
+
+    return 0.0, "NEUTRAL"
 
 
 def _bias_to_technical_score(bias: str) -> float:
@@ -240,10 +281,24 @@ def calculate_bias_score(
     news_score = _bias_to_news_score(news_bias)
     dxy_score  = _dxy_to_gold_score(dxy_bias)
 
-    # Intraday VWAP confirmation (requires price; fetched after other components)
+    # Intraday VWAP (direction-aware — requires tentative direction from prelim score)
+    prelim_score      = tech_score + news_score + dxy_score
+    tentative_dir     = "LONG" if prelim_score > 0 else ("SHORT" if prelim_score < 0 else "NONE")
     current_price_for_vwap = _get_current_price()
     session_vwap, vwap_session = _get_session_vwap()
-    vwap_score, vwap_bias = _vwap_to_score(current_price_for_vwap, session_vwap)
+    vwap_score, vwap_bias = _vwap_to_score(current_price_for_vwap, session_vwap, tentative_dir)
+
+    # VWAP distance lot modifier (ATR-based)
+    m5_atr = _get_m5_atr(period=14)
+    if m5_atr > 0 and session_vwap > 0 and current_price_for_vwap > 0:
+        dist = abs(current_price_for_vwap - session_vwap)
+        vwap_distance_atr = round(dist / m5_atr, 2)
+        vwap_lot_modifier = (
+            VWAP_LOT_OVEREXTENDED if vwap_distance_atr > VWAP_OVEREXTENDED_ATR else 1.0
+        )
+    else:
+        vwap_distance_atr = 0.0
+        vwap_lot_modifier = 1.0
 
     raw_score  = tech_score + news_score + dxy_score + vwap_score
 
@@ -254,6 +309,8 @@ def calculate_bias_score(
         final_score = raw_score
 
     signal, direction, lot_modifier, strength = _classify(final_score)
+    # Apply VWAP distance modifier to lot size (overextended → 75% of normal)
+    lot_modifier = round(lot_modifier * vwap_lot_modifier, 4)
 
     # ── Regime & SHORT qualification filters ──────────────────────────────────
     current_price   = current_price_for_vwap   # already fetched above
@@ -323,6 +380,9 @@ def calculate_bias_score(
         session_vwap       = session_vwap,
         vwap_bias          = vwap_bias,
         vwap_session       = vwap_session,
+        vwap_lot_modifier  = vwap_lot_modifier,
+        vwap_distance_atr  = vwap_distance_atr,
+        m5_atr             = m5_atr,
         current_price      = current_price,
         h4_sma_50          = h4_sma_50,
         h4_sma_200         = h4_sma_200,
@@ -358,9 +418,14 @@ def print_bias_report(result: BiasResult) -> None:
     news_label = f"{result.news_bias:<8} ({sign(result.news_score)})"
     dxy_label  = f"{result.dxy_bias:<8} ({sign(result.dxy_score)})"
     if result.session_vwap > 0:
+        dist_str = (f"  dist={result.vwap_distance_atr:.1f}x ATR"
+                    if result.m5_atr > 0 else "")
+        lot_str  = (f"  [LOT x{result.vwap_lot_modifier:.2f} -- overextended]"
+                    if result.vwap_lot_modifier < 1.0 else "")
         vwap_label = (
             f"{result.vwap_bias:<8} ({sign(result.vwap_score)})  "
             f"VWAP={result.session_vwap:.2f}  [{result.vwap_session}]"
+            f"{dist_str}{lot_str}"
         )
     else:
         vwap_label = "NEUTRAL  (unavailable)"

@@ -24,6 +24,11 @@ SESSIONS = {
 # ─── High-Impact News Blackout (minutes before/after) ────────────────────────
 NEWS_BLACKOUT_MINUTES = 30
 
+# --- Breakeven Trigger -------------------------------------------------------
+# Fraction of the way from entry to TP at which SL is moved to entry.
+# 0.33 = trigger BE when price has covered 1/3 of the way to TP.
+BREAKEVEN_TRIGGER = 0.33
+
 # --- Execution Mode ----------------------------------------------------------
 # PAPER_TRADE_MODE = True  -> log orders only, nothing sent to MT5
 # PAPER_TRADE_MODE = False -> live execution (only after full testing)
