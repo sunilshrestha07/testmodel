@@ -45,6 +45,7 @@ from fvg_detector import (
     MIN_FVG_PIPS, MIN_MSS_BREAK_PIPS, MIN_MSS_BODY_RATIO,
     MIN_RETRACE_PCT, MIN_OB_PIPS,
     STRONG_SWEEP_PIPS, STRONG_SWEEP_MSS_BODY_RATIO,
+    compute_atr, is_trending_regime, RR_TRENDING, RR_CHOPPY,
 )
 from market_structure import get_swing_highs_lows
 from risk_manager import calculate_lot_size
@@ -134,6 +135,7 @@ class BacktestTrade:
     vwap:              float = 0.0    # session VWAP at trade entry
     vwap_aligned:      bool  = True   # True when entry is in discount/premium zone for direction
     vwap_lot_modifier: float = 1.0   # 1.0 normal | 0.75 overextended (>2x ATR from VWAP)
+    regime:            str   = "TRENDING"  # "TRENDING" (1:4 RR) | "CHOPPY" (1:2 RR)
     entry_ts_utc:  object           = None   # pd.Timestamp -- not in CSV output
 
 
@@ -514,6 +516,12 @@ def _scan_for_entry_verbose(
     ):
         return None, "NO_RETRACE"
 
+    # Regime: trending vs choppy based on daily range vs M5 ATR.
+    # Trending (range >= 2.5x ATR) → 1:4 RR target; Choppy → 1:2 RR target.
+    _m5_atr    = compute_atr(sub)
+    _regime    = "TRENDING" if is_trending_regime(pdh, pdl, _m5_atr) else "CHOPPY"
+    _rr_target = RR_TRENDING if _regime == "TRENDING" else RR_CHOPPY
+
     # FVG with quality filters: ≥ 3 pips, within ±5 candles of MSS,
     # in discount/premium zone, closest to current price when multiple exist.
     cur_price_at_scan = float(sub.iloc[-1]["close"])
@@ -544,7 +552,7 @@ def _scan_for_entry_verbose(
                 entry    = fallback.midpoint
                 sl       = fallback.candle_low - buf
                 risk     = entry - sl
-                tp_ideal = pdh if pdh > entry else entry + 3 * risk
+                tp_ideal = pdh if pdh > entry else entry + _rr_target * risk
                 tp       = min(tp_ideal, entry + MAX_RR_CAP * risk)
                 # Pseudo-FVG: stores the OB/MSS zone for fvg_top/bottom fields
                 zone = FVGZone(top=fallback.body_top, bottom=fallback.candle_low,
@@ -555,7 +563,7 @@ def _scan_for_entry_verbose(
                 entry    = fallback.midpoint
                 sl       = fallback.candle_high + buf
                 risk     = sl - entry
-                tp_ideal = pdl if (pdl > 0 and pdl < entry) else entry - 3 * risk
+                tp_ideal = pdl if (pdl > 0 and pdl < entry) else entry - _rr_target * risk
                 tp       = max(tp_ideal, entry - MAX_RR_CAP * risk)
                 zone = FVGZone(top=fallback.candle_high, bottom=fallback.body_bottom,
                                midpoint=fallback.midpoint,
@@ -566,7 +574,7 @@ def _scan_for_entry_verbose(
             reward = abs(tp - entry)
             if risk > 0 and reward / risk >= MIN_RR:
                 entry_type = "OB_ENTRY" if ob.found else "MSS_ENTRY"
-                return (entry, sl, tp, sweep_lvl, zone, entry_type, sweep_time), "TRADE"
+                return (entry, sl, tp, sweep_lvl, zone, entry_type, sweep_time, _regime), "TRADE"
 
         return None, "NO_FVG"
 
@@ -579,13 +587,13 @@ def _scan_for_entry_verbose(
         entry    = fvg.midpoint
         sl       = fvg.bottom - buf
         risk     = entry - sl
-        tp_ideal = pdh if pdh > entry else entry + 3 * risk
+        tp_ideal = pdh if pdh > entry else entry + _rr_target * risk
         tp       = min(tp_ideal, entry + MAX_RR_CAP * risk)
     else:
         entry    = fvg.midpoint
         sl       = fvg.top + buf
         risk     = sl - entry
-        tp_ideal = pdl if (pdl > 0 and pdl < entry) else entry - 3 * risk
+        tp_ideal = pdl if (pdl > 0 and pdl < entry) else entry - _rr_target * risk
         tp       = max(tp_ideal, entry - MAX_RR_CAP * risk)
 
     risk   = abs(entry - sl)
@@ -593,7 +601,7 @@ def _scan_for_entry_verbose(
     if risk <= 0 or reward / risk < MIN_RR:
         return None, "LOW_RR"
 
-    return (entry, sl, tp, sweep_lvl, fvg, "FVG_ENTRY", sweep_time), "TRADE"
+    return (entry, sl, tp, sweep_lvl, fvg, "FVG_ENTRY", sweep_time, _regime), "TRADE"
 
 
 def _scan_for_entry(
@@ -923,7 +931,7 @@ def run_backtest(
         if result is None:
             continue
 
-        entry, sl, tp, sweep_lvl, fvg, entry_type, sweep_ts = result
+        entry, sl, tp, sweep_lvl, fvg, entry_type, sweep_ts, trade_regime = result
 
         # Cross-window duplicate guard: if this exact sweep candle was already
         # used for a trade today (e.g. NY AM traded it, NY PM finds it again),
@@ -988,6 +996,7 @@ def run_backtest(
             vwap              = trade_vwap,
             vwap_aligned      = trade_vwap_aligned,
             vwap_lot_modifier = trade_vwap_lot_mod,
+            regime            = trade_regime,
             entry_ts_utc      = ts_utc,
         )
         in_trade   = True

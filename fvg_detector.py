@@ -50,8 +50,17 @@ MIN_OB_PIPS           = 5.0   # Order Block body must be ≥ 5 pips wide
 # the sweep itself is strong institutional confirmation. The MSS body-ratio filter
 # is relaxed from 0.60 → 0.40 so that less decisive candles can still qualify.
 # min_break_pips (3 pips) is NOT relaxed — the structure break must still be real.
-STRONG_SWEEP_PIPS           = 5.0   # wick depth (pips) that qualifies as "strong"
+STRONG_SWEEP_PIPS           = 3.0   # wick depth (pips) that qualifies as "strong"
 STRONG_SWEEP_MSS_BODY_RATIO = 0.40  # relaxed body/range ratio for strong-sweep sessions
+
+# Regime-based TP targeting
+# Trending day  : daily range (PDH-PDL) >= TRENDING_RANGE_ATR × M5 ATR(14)  → 1:4 RR target
+# Choppy day    : daily range  < TRENDING_RANGE_ATR × M5 ATR(14)             → 1:2 RR target
+# MAX_RR_CAP (backtester) still caps the absolute ceiling.
+TRENDING_RANGE_ATR = 20.0  # daily-range / M5-ATR threshold that defines a trending day
+                           # XAUUSD p25=20x, median=25x, min=9x → bottom ~25% classified CHOPPY
+RR_TRENDING        = 4.0   # TP multiplier on a trending day  (1:4 RR)
+RR_CHOPPY          = 2.0   # TP multiplier on a choppy day    (1:2 RR)
 
 
 # --- Data classes -------------------------------------------------------------
@@ -171,6 +180,26 @@ def _compute_atr(candles: pd.DataFrame, period: int = 14) -> float:
         for i in range(1, len(candles))
     ]
     return float(sum(tr_vals[-period:]) / period)
+
+
+def compute_atr(candles: pd.DataFrame, period: int = 14) -> float:
+    """Public wrapper around _compute_atr. Returns ATR over `period` bars."""
+    return _compute_atr(candles, period)
+
+
+def is_trending_regime(pdh: float, pdl: float, m5_atr: float) -> bool:
+    """
+    Return True when the daily range signals a trending (impulsive) day.
+
+    Trending  : (PDH - PDL) / M5 ATR(14) >= TRENDING_RANGE_ATR (2.5)  → target 1:4 RR
+    Choppy    : ratio below threshold                                   → target 1:2 RR
+
+    Defaults to True (trending) when ATR or levels are unavailable so that the
+    wider TP does not silently fire on bad data.
+    """
+    if m5_atr <= 0 or pdh <= pdl:
+        return True
+    return (pdh - pdl) / m5_atr >= TRENDING_RANGE_ATR
 
 
 # --- 1. Liquidity Sweep -------------------------------------------------------
@@ -855,17 +884,22 @@ def get_entry_setup(
             )
 
     # --- Step 5: Calculate entry / SL / TP -----------------------------------
+    # Regime: use daily range vs M5 ATR to pick the RR target.
+    _pdh_val   = float(pdh) if pdh else 0.0
+    _pdl_val   = float(pdl) if pdl else 0.0
+    _atr       = _compute_atr(df_m5)
+    _rr_target = RR_TRENDING if is_trending_regime(_pdh_val, _pdl_val, _atr) else RR_CHOPPY
+
     buf = SL_BUFFER * PIP_VALUE
 
     if direction == "bullish":
         entry = fvg.midpoint
         sl    = fvg.bottom - buf
-        # TP: PDH first; fallback to 3x risk
         risk  = entry - sl
         if tp_target and float(tp_target) > entry:
             tp = float(tp_target)
         else:
-            tp = entry + 3.0 * risk
+            tp = entry + _rr_target * risk
     else:
         entry = fvg.midpoint
         sl    = fvg.top + buf
@@ -873,7 +907,7 @@ def get_entry_setup(
         if tp_target and float(tp_target) < entry:
             tp = float(tp_target)
         else:
-            tp = entry - 3.0 * risk
+            tp = entry - _rr_target * risk
 
     reward = abs(tp - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
