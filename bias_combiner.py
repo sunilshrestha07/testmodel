@@ -15,7 +15,8 @@ Scoring weights:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone as _tz
 
 import MetaTrader5 as mt5
 
@@ -34,6 +35,7 @@ logging.basicConfig(
 W_TECHNICAL           = 0.40
 W_NEWS                = 0.35
 W_DXY                 = 0.25
+W_VWAP                = 0.10   # intraday VWAP confirmation
 DIVERGENCE_MULTIPLIER = 0.30   # collapses score when gold and DXY agree
 
 # --- Thresholds ---------------------------------------------------------------
@@ -42,15 +44,17 @@ WEAK_THRESHOLD   = 0.30
 
 # Per-window minimum |score| required before a trade is permitted
 WINDOW_THRESHOLDS: dict[str, float] = {
-    "ASIAN_SWEEP_WINDOW":  0.50,
-    "NY_AM_SILVER_BULLET": 0.70,   # weakest historical window — requires stronger confluence
-    "NY_PM_SILVER_BULLET": 0.50,
+    "ASIAN_SWEEP_WINDOW":        0.50,
+    "LONDON_OPEN_SILVER_BULLET": 0.50,
+    "NY_AM_SILVER_BULLET":       0.70,   # weakest historical window — requires stronger confluence
+    "NY_PM_SILVER_BULLET":       0.50,
 }
 
 # Maximum score achievable without the news component.
 # Use this as `available_weight` when calling is_score_sufficient() in backtest
 # mode, so thresholds scale proportionally to what is actually computable.
-W_MAX_PARTIAL: float = W_TECHNICAL + W_DXY   # 0.40 + 0.25 = 0.65
+# VWAP is computable in real-time so it's included here.
+W_MAX_PARTIAL: float = W_TECHNICAL + W_DXY + W_VWAP   # 0.40 + 0.25 + 0.10 = 0.75
 
 
 # --- Result dataclass ---------------------------------------------------------
@@ -67,6 +71,7 @@ class BiasResult:
     technical_score: float
     news_score:      float
     dxy_score:       float
+    vwap_score:      float
     raw_score:       float
     final_score:     float
 
@@ -75,6 +80,11 @@ class BiasResult:
     direction:    str    # LONG / SHORT / NONE
     lot_modifier: float  # 1.0 / 0.5 / 0.0
     strength:     str    # STRONG / WEAK / NONE
+
+    # VWAP (populated after score; defaults allow old callers to work)
+    session_vwap:    float = 0.0
+    vwap_bias:       str   = "NEUTRAL"   # BULLISH / BEARISH / NEUTRAL
+    vwap_session:    str   = ""          # Asian / London / NY
 
     # Regime & SHORT qualification (populated after score; defaults allow old callers to work)
     current_price:   float = 0.0
@@ -117,6 +127,63 @@ def _get_current_price() -> float:
     """Return current bid price for the gold symbol."""
     tick = mt5.symbol_info_tick(SYMBOL)
     return float(tick.bid) if tick else 0.0
+
+
+def _get_session_vwap() -> tuple[float, str]:
+    """
+    Calculate session VWAP from the current session open using M5 candles.
+    Typical price = (H + L + C) / 3, weighted by tick_volume.
+    Falls back to equal-weight (simple mean) when tick_volume is zero.
+
+    Sessions (UTC):
+      Asian  00:00 – 07:00
+      London 07:00 – 12:00
+      NY     12:00 – close
+
+    Returns (vwap_price, session_label).  Returns (0.0, label) on data failure.
+    """
+    now = datetime.now(_tz.utc)
+    h = now.hour
+    if h < 7:
+        sess_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        sess_label = "Asian"
+    elif h < 12:
+        sess_start = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        sess_label = "London"
+    else:
+        sess_start = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        sess_label = "NY"
+
+    elapsed_min = max(5, int((now - sess_start).total_seconds() / 60))
+    n_bars = elapsed_min // 5 + 5
+
+    rates = mt5.copy_rates_from(SYMBOL, mt5.TIMEFRAME_M5, sess_start, n_bars)
+    if rates is None or len(rates) == 0:
+        log.warning("VWAP: no M5 data for %s session (start=%s)", sess_label, sess_start)
+        return 0.0, sess_label
+
+    total_tpv = 0.0
+    total_vol = 0.0
+    for r in rates:
+        tp  = (float(r["high"]) + float(r["low"]) + float(r["close"])) / 3.0
+        vol = float(r["tick_volume"]) if r["tick_volume"] > 0 else 1.0
+        total_tpv += tp * vol
+        total_vol += vol
+
+    vwap = round(total_tpv / total_vol, 2) if total_vol > 0 else 0.0
+    return vwap, sess_label
+
+
+def _vwap_to_score(price: float, vwap: float) -> tuple[float, str]:
+    """
+    Return (score, bias) based on price position relative to session VWAP.
+    Returns (0.0, 'NEUTRAL') when VWAP is unavailable (0.0).
+    """
+    if vwap <= 0 or price <= 0:
+        return 0.0, "NEUTRAL"
+    if price > vwap:
+        return W_VWAP, "BULLISH"
+    return -W_VWAP, "BEARISH"
 
 
 def _bias_to_technical_score(bias: str) -> float:
@@ -172,7 +239,13 @@ def calculate_bias_score(
     tech_score = _bias_to_technical_score(gold_bias)
     news_score = _bias_to_news_score(news_bias)
     dxy_score  = _dxy_to_gold_score(dxy_bias)
-    raw_score  = tech_score + news_score + dxy_score
+
+    # Intraday VWAP confirmation (requires price; fetched after other components)
+    current_price_for_vwap = _get_current_price()
+    session_vwap, vwap_session = _get_session_vwap()
+    vwap_score, vwap_bias = _vwap_to_score(current_price_for_vwap, session_vwap)
+
+    raw_score  = tech_score + news_score + dxy_score + vwap_score
 
     # Divergence penalty
     if divergence == "DIVERGENCE":
@@ -183,7 +256,7 @@ def calculate_bias_score(
     signal, direction, lot_modifier, strength = _classify(final_score)
 
     # ── Regime & SHORT qualification filters ──────────────────────────────────
-    current_price   = _get_current_price()
+    current_price   = current_price_for_vwap   # already fetched above
     h4_sma_50       = _get_h4_sma(SYMBOL, 50)
     h4_sma_200      = _get_h4_sma(SYMBOL, 200)
     bull_regime     = h4_sma_200 > 0 and current_price > h4_sma_200
@@ -240,12 +313,16 @@ def calculate_bias_score(
         technical_score    = tech_score,
         news_score         = news_score,
         dxy_score          = dxy_score,
+        vwap_score         = vwap_score,
         raw_score          = raw_score,
         final_score        = final_score,
         signal             = signal,
         direction          = direction,
         lot_modifier       = lot_modifier,
         strength           = strength,
+        session_vwap       = session_vwap,
+        vwap_bias          = vwap_bias,
+        vwap_session       = vwap_session,
         current_price      = current_price,
         h4_sma_50          = h4_sma_50,
         h4_sma_200         = h4_sma_200,
@@ -280,6 +357,13 @@ def print_bias_report(result: BiasResult) -> None:
     tech_label = f"{result.technical_bias:<8} ({sign(result.technical_score)})"
     news_label = f"{result.news_bias:<8} ({sign(result.news_score)})"
     dxy_label  = f"{result.dxy_bias:<8} ({sign(result.dxy_score)})"
+    if result.session_vwap > 0:
+        vwap_label = (
+            f"{result.vwap_bias:<8} ({sign(result.vwap_score)})  "
+            f"VWAP={result.session_vwap:.2f}  [{result.vwap_session}]"
+        )
+    else:
+        vwap_label = "NEUTRAL  (unavailable)"
 
     if result.divergence == "DIVERGENCE":
         div_label = f"DIVERGENCE  (score x{DIVERGENCE_MULTIPLIER} penalty applied)"
@@ -318,6 +402,7 @@ def print_bias_report(result: BiasResult) -> None:
     print(f"  Technical  : {tech_label}")
     print(f"  News       : {news_label}")
     print(f"  DXY        : {dxy_label}")
+    print(f"  VWAP       : {vwap_label}")
     print(f"  Divergence : {div_label}")
     bar55 = "-" * 50
     print(f"  {bar55}")

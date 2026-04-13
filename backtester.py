@@ -64,28 +64,42 @@ SL_BUFFER      = 3.0   # pip buffer beyond FVG edge for SL  (was 2.0 -- raised t
 MIN_WICK_PIPS  = 1.0   # min wick beyond sweep level        (was 1.5 -- lowered; diagnostics showed real sweeps missed at 1.0-1.5 pip)
 ZONE_FILTER    = False  # require FVG in premium/discount zone (off -- too restrictive in trends)
 PIP_VALUE      = 1.0   # $1.00 per pip for XAUUSD (in risk calc)
-MAX_TRADES_PER_DAY = 3  # raised from 2 -- allow all 3 windows to fire on the same day
+MAX_TRADES_PER_DAY = 4  # 4 windows can now fire on the same day
 
 # --- Trading windows in NPT (h_start, m_start, h_end, m_end) ----------------
 WINDOWS = {
-    "ASIAN_RANGE":          ((5, 45), (12, 45)),
-    "ASIAN_SWEEP_WINDOW":   ((12, 45), (13, 45)),
-    "NY_AM_SILVER_BULLET":  ((19, 45), (20, 45)),
-    "NY_PM_SILVER_BULLET":  ((23, 45), (0, 45)),
+    "ASIAN_RANGE":                ((5, 45),  (12, 45)),
+    "ASIAN_SWEEP_WINDOW":         ((12, 45), (13, 45)),
+    "LONDON_OPEN_SILVER_BULLET":  ((13, 45), (14, 45)),
+    "NY_AM_SILVER_BULLET":        ((19, 45), (20, 45)),
+    "NY_PM_SILVER_BULLET":        ((23, 45), (0, 45)),
 }
-TRADE_WINDOWS = {"ASIAN_SWEEP_WINDOW", "NY_AM_SILVER_BULLET", "NY_PM_SILVER_BULLET"}
+TRADE_WINDOWS = {
+    "ASIAN_SWEEP_WINDOW",
+    "LONDON_OPEN_SILVER_BULLET",
+    "NY_AM_SILVER_BULLET",
+    "NY_PM_SILVER_BULLET",
+}
 
-# UTC open times for each trade window.  Used to compute a window-scoped
-# lookback so the entry scanner only sees candles from the current window,
-# not setups that formed in previous sessions.
-# (NPT = UTC + 5:45, so ASIAN_SWEEP 12:45 NPT = 07:00 UTC etc.)
+# UTC open times for each trade window.
+# NPT = UTC + 5:45 → ASIAN_SWEEP 12:45 NPT = 07:00 UTC etc.
 _WIN_OPEN_UTC: dict[str, tuple[int, int]] = {
-    "ASIAN_SWEEP_WINDOW":   (7,  0),   # 12:45 NPT
-    "NY_AM_SILVER_BULLET":  (14, 0),   # 19:45 NPT
-    "NY_PM_SILVER_BULLET":  (18, 0),   # 23:45 NPT
+    "ASIAN_SWEEP_WINDOW":         (7,  0),   # 12:45 NPT
+    "LONDON_OPEN_SILVER_BULLET":  (8,  0),   # 13:45 NPT
+    "NY_AM_SILVER_BULLET":        (14, 0),   # 19:45 NPT
+    "NY_PM_SILVER_BULLET":        (18, 0),   # 23:45 NPT
 }
 
 OUTPUT_DIR = Path(__file__).parent / "backtest_results"
+
+# UTC hour at which VWAP resets for each trading window's parent session.
+# Asian session  00:00 UTC  |  London 07:00 UTC  |  NY 12:00 UTC
+_WIN_SESSION_VWAP_START_UTC: dict[str, int] = {
+    "ASIAN_SWEEP_WINDOW":        0,   # Asian session VWAP
+    "LONDON_OPEN_SILVER_BULLET": 7,   # London session VWAP
+    "NY_AM_SILVER_BULLET":       12,  # NY session VWAP
+    "NY_PM_SILVER_BULLET":       12,  # same NY session
+}
 
 
 # --- Data classes ------------------------------------------------------------
@@ -113,6 +127,8 @@ class BacktestTrade:
     h4_bias:       str              = ""
     entry_type:    str              = "FVG_ENTRY"   # "FVG_ENTRY" | "OB_ENTRY" | "MSS_ENTRY"
     be_triggered:  bool             = False
+    vwap:          float            = 0.0    # session VWAP at trade entry
+    vwap_aligned:  bool             = True   # True when entry is between VWAP and TP
     entry_ts_utc:  object           = None   # pd.Timestamp -- not in CSV output
 
 
@@ -217,6 +233,32 @@ def _h4_sma_at(h4_df: pd.DataFrame, as_of: pd.Timestamp, period: int) -> float:
     return float(closes.mean())
 
 
+def _session_vwap_at(
+    m5_df: pd.DataFrame,
+    as_of: pd.Timestamp,
+    session_start: pd.Timestamp,
+) -> float:
+    """
+    Calculate session VWAP from session_start up to (not including) as_of.
+
+    Typical price = (H + L + C) / 3.
+    Weights by tick_volume; falls back to equal-weight when volume is zero.
+    Returns 0.0 when fewer than 2 M5 candles are available in the session.
+    """
+    mask = (m5_df.index >= session_start) & (m5_df.index < as_of)
+    sub  = m5_df[mask]
+    if len(sub) < 2:
+        return 0.0
+    typical   = (sub["high"] + sub["low"] + sub["close"]) / 3.0
+    vol_col   = "tick_volume" if "tick_volume" in sub.columns else None
+    total_vol = float(sub[vol_col].sum()) if vol_col else 0.0
+    if total_vol > 0:
+        vwap = float((typical * sub[vol_col]).sum() / total_vol)
+    else:
+        vwap = float(typical.mean())
+    return round(vwap, 2)
+
+
 # --- Session level computers -------------------------------------------------
 
 def _prev_day_levels(d1_df: pd.DataFrame, as_of_date: date) -> tuple[float, float]:
@@ -241,6 +283,31 @@ def _asian_levels(h1_df: pd.DataFrame, as_of_date: date) -> tuple[float, float]:
     day_end   = day_start + timedelta(hours=7)
     mask = (h1_df.index >= day_start) & (h1_df.index < day_end)
     sub  = h1_df[mask]
+    if sub.empty:
+        return 0.0, 0.0
+    return float(sub["high"].max()), float(sub["low"].min())
+
+
+def _weekly_levels(d1_df: pd.DataFrame, as_of_date: date) -> tuple[float, float]:
+    """
+    Return (weekly_high, weekly_low) = the highest high and lowest low of the
+    completed daily candles in the current week (Monday through yesterday).
+
+    Weekly liquidity levels are primary institutional targets.  They are passed
+    to the entry scanner as additional sweep candidates so that NY and London
+    sessions can trade a sweep of the week's range, not only PDH/PDL or ASH/ASL.
+    Returns (0.0, 0.0) when no completed weekly candles are available yet
+    (e.g. Monday before the first close of the week).
+    """
+    # Monday of the current week
+    days_since_monday = as_of_date.weekday()   # Mon=0 … Sun=6
+    week_start = as_of_date - timedelta(days=days_since_monday)
+    week_start_ts = pd.Timestamp(week_start, tz=UTC)
+    today_ts      = pd.Timestamp(as_of_date, tz=UTC)
+
+    # Candles in [week_start, today) — completed days only
+    mask = (d1_df.index >= week_start_ts) & (d1_df.index < today_ts)
+    sub  = d1_df[mask]
     if sub.empty:
         return 0.0, 0.0
     return float(sub["high"].max()), float(sub["low"].min())
@@ -328,16 +395,17 @@ STAGE_ORDER = [
     "MAX_TRADES",                  #  1 - couldn't scan: daily trade limit hit
     "NO_PDH_PDL",                  #  2 - missing previous-day levels
     "RANGING",                     #  3 - H4 bias not directional
-    "BULL_REGIME_SHORT_BLOCKED",   #  4 - price > 200 SMA → only LONGs allowed
-    "SHORT_NO_BULL_DXY",           #  5 - SHORT skipped: DXY H4 not clearly BULLISH
-    "SHORT_ABOVE_50SMA",           #  6 - SHORT skipped: price is above 50-period H4 SMA
-    "LONG_BELOW_50SMA",            #  7 - LONG skipped: price is below 50-period H4 SMA
-    "NO_SWEEP",                    #  8 - no liquidity sweep found
-    "NO_MSS",                      #  8 - sweep found, but no MSS
-    "NO_FVG",                      #  9 - MSS found, but no valid FVG
-    "WRONG_ZONE",                  # 10 - FVG exists but in wrong premium/discount zone
-    "LOW_RR",                      # 11 - zone OK but reward:risk below minimum
-    "TRADE",                       # 12 - setup complete, trade taken
+    "PREV_SESSION_LOSS",           #  4 - London Open skipped: Asian Sweep already lost today
+    "BULL_REGIME_SHORT_BLOCKED",   #  5 - price > 200 SMA → only LONGs allowed
+    "SHORT_NO_BULL_DXY",           #  6 - SHORT skipped: DXY H4 not clearly BULLISH
+    "SHORT_ABOVE_50SMA",           #  7 - SHORT skipped: price is above 50-period H4 SMA
+    "LONG_BELOW_50SMA",            #  8 - LONG skipped: price is below 50-period H4 SMA
+    "NO_SWEEP",                    #  9 - no liquidity sweep found
+    "NO_MSS",                      # 10 - sweep found, but no MSS
+    "NO_FVG",                      # 11 - MSS found, but no valid FVG
+    "WRONG_ZONE",                  # 12 - FVG exists but in wrong premium/discount zone
+    "LOW_RR",                      # 13 - zone OK but reward:risk below minimum
+    "TRADE",                       # 14 - setup complete, trade taken
 ]
 _STAGE_RANK = {s: i for i, s in enumerate(STAGE_ORDER)}
 
@@ -349,6 +417,8 @@ def _scan_for_entry_verbose(
     direction:   str,
     pdh: float, pdl: float,
     ash: float, asl: float,
+    wh:  float = 0.0,   # weekly high (additional sweep candidate)
+    wl:  float = 0.0,   # weekly low  (additional sweep candidate)
     window_open: Optional[pd.Timestamp] = None,  # kept for API compat; unused
 ) -> tuple[Optional[tuple], str]:
     """
@@ -365,9 +435,11 @@ def _scan_for_entry_verbose(
     if direction == "bullish":
         if asl > 0:  candidates.append(("ASL", asl))
         if pdl > 0:  candidates.append(("PDL", pdl))
+        if wl  > 0:  candidates.append(("WL",  wl))
     else:
         if ash > 0:  candidates.append(("ASH", ash))
         if pdh > 0:  candidates.append(("PDH", pdh))
+        if wh  > 0:  candidates.append(("WH",  wh))
 
     sweep_res  = None
     sweep_lvl  = 0.0
@@ -459,11 +531,13 @@ def _scan_for_entry_verbose(
 def _scan_for_entry(
     m5_df: pd.DataFrame, cur_idx: int, lookback: int,
     direction: str, pdh: float, pdl: float, ash: float, asl: float,
+    wh: float = 0.0, wl: float = 0.0,
     window_open: Optional[pd.Timestamp] = None,
 ) -> Optional[tuple]:
     """Thin wrapper — returns result only (no reason code)."""
     result, _ = _scan_for_entry_verbose(m5_df, cur_idx, lookback, direction,
-                                        pdh, pdl, ash, asl, window_open=window_open)
+                                        pdh, pdl, ash, asl, wh=wh, wl=wl,
+                                        window_open=window_open)
     return result
 
 
@@ -539,7 +613,9 @@ def run_backtest(
     trades_today       = 0
     day_pdh = day_pdl  = 0.0
     day_ash = day_asl  = 0.0
+    day_wh  = day_wl   = 0.0   # weekly high/low (additional sweep candidates)
     day_used_sweep_times: set = set()   # sweep candle timestamps already traded today
+    day_window_losses:    set = set()   # windows that closed a trade at SL today
     in_trade           = False
     open_trade:        Optional[BacktestTrade] = None
 
@@ -565,7 +641,9 @@ def run_backtest(
             trades_today = 0
             day_pdh, day_pdl = _prev_day_levels(d1_df, today)
             day_ash, day_asl = _asian_levels(h1_df, today)
+            day_wh,  day_wl  = _weekly_levels(d1_df, today)
             day_used_sweep_times = set()   # reset daily sweep dedup
+            day_window_losses    = set()   # reset daily window-loss tracker
 
             # Record equity at each day boundary
             equity_rows.append({
@@ -656,11 +734,12 @@ def run_backtest(
                 open_trade.duration_m  = max(5, abs(dur))
 
                 balance += pnl
+                # Track SL exits per window so later windows can filter
+                if open_trade.exit_reason == "SL":
+                    day_window_losses.add(open_trade.window)
                 trades.append(open_trade)
                 in_trade   = False
                 open_trade = None
-                log.debug("Trade closed: %s  pnl=%.2f  balance=%.2f",
-                          open_trade.exit_reason if open_trade else "?", pnl, balance)
             continue
 
         # Gate: trading window (only track sessions we care about)
@@ -678,6 +757,14 @@ def run_backtest(
         # Gate: max trades per day
         if trades_today >= MAX_TRADES_PER_DAY:
             _update_session("MAX_TRADES")
+            continue
+
+        # Gate: London Open skipped when Asian Sweep already hit SL today.
+        # Both windows trade the same H4 bias on the same morning; a loss in
+        # Asian Sweep signals the intraday move is against the bias.
+        if (window == "LONDON_OPEN_SILVER_BULLET"
+                and "ASIAN_SWEEP_WINDOW" in day_window_losses):
+            _update_session("PREV_SESSION_LOSS")
             continue
 
         # Gate: need valid PDH/PDL
@@ -761,6 +848,7 @@ def run_backtest(
         result, reason = _scan_for_entry_verbose(
             m5_df, idx, M5_LOOKBACK, direction,
             day_pdh, day_pdl, day_ash, day_asl,
+            wh=day_wh, wl=day_wl,
             window_open=_win_open,
         )
         _update_session(reason)
@@ -775,6 +863,23 @@ def run_backtest(
         if sweep_ts is not None and sweep_ts in day_used_sweep_times:
             _update_session("NO_SWEEP")   # treat as if no sweep found
             continue
+
+        # --- Session VWAP at entry -------------------------------------------
+        _vwap_sess_hour = _WIN_SESSION_VWAP_START_UTC.get(window, 0)
+        _vwap_sess_start = pd.Timestamp(today, tz=UTC).replace(hour=_vwap_sess_hour, minute=0)
+        trade_vwap = _session_vwap_at(m5_df, ts_utc, _vwap_sess_start)
+
+        # VWAP alignment: entry must be between VWAP and TP
+        # LONG:  VWAP < entry < TP   (bullish confirmation)
+        # SHORT: TP   < entry < VWAP (bearish confirmation)
+        if trade_vwap > 0:
+            if direction == "bullish":
+                trade_vwap_aligned = entry > trade_vwap
+            else:
+                trade_vwap_aligned = entry < trade_vwap
+        else:
+            trade_vwap_aligned = True   # VWAP unavailable → don't filter
+        # ---------------------------------------------------------------------
 
         # Lot size
         sl_pips = abs(entry - sl) / 0.10
@@ -800,6 +905,8 @@ def run_backtest(
             fvg_bottom   = round(fvg.bottom, 2),
             h4_bias      = h4_bias_label,
             entry_type   = entry_type,
+            vwap         = trade_vwap,
+            vwap_aligned = trade_vwap_aligned,
             entry_ts_utc = ts_utc,
         )
         in_trade   = True
@@ -848,6 +955,7 @@ def _compute_session_report(session_best: dict) -> dict:
         "skip_max_trades":              counts["MAX_TRADES"],
         "skip_no_pdh_pdl":             counts["NO_PDH_PDL"],
         "skip_ranging":                 counts["RANGING"],
+        "skip_prev_session_loss":       counts["PREV_SESSION_LOSS"],
         "skip_bull_regime_short":       counts["BULL_REGIME_SHORT_BLOCKED"],
         "skip_short_no_bull_dxy":       counts["SHORT_NO_BULL_DXY"],
         "skip_short_above_50sma":       counts["SHORT_ABOVE_50SMA"],
@@ -1008,6 +1116,43 @@ def _compute_stats(trades: list[BacktestTrade], equity_df: pd.DataFrame) -> dict
     }
 
 
+# --- VWAP comparison ---------------------------------------------------------
+
+def _compute_vwap_comparison(trades: list[BacktestTrade]) -> dict:
+    """
+    Compare performance with vs. without VWAP alignment filter.
+
+    VWAP-aligned: entry is between session VWAP and TP target
+      LONG  → entry > VWAP  (bullish confirmation)
+      SHORT → entry < VWAP  (bearish confirmation)
+
+    Returns a dict with side-by-side stats for the report.
+    """
+    def _quick_stats(subset: list[BacktestTrade]) -> dict:
+        if not subset:
+            return {"trades": 0, "wins": 0, "losses": 0, "bes": 0,
+                    "win_rate": 0.0, "dir_wr": 0.0, "net_pnl": 0.0}
+        wins   = sum(1 for t in subset if t.pnl > 0.01)
+        losses = sum(1 for t in subset if t.pnl < -0.01)
+        bes    = sum(1 for t in subset if abs(t.pnl) <= 0.01)
+        wr     = round(wins / len(subset) * 100, 1)
+        dir_wr = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0.0
+        net    = round(sum(t.pnl for t in subset), 2)
+        return {"trades": len(subset), "wins": wins, "losses": losses, "bes": bes,
+                "win_rate": wr, "dir_wr": dir_wr, "net_pnl": net}
+
+    aligned     = [t for t in trades if t.vwap_aligned]
+    not_aligned = [t for t in trades if not t.vwap_aligned]
+    no_vwap     = [t for t in trades if t.vwap == 0.0]   # VWAP unavailable
+
+    return {
+        "all":         _quick_stats(trades),
+        "aligned":     _quick_stats(aligned),
+        "not_aligned": _quick_stats(not_aligned),
+        "no_vwap":     len(no_vwap),
+    }
+
+
 # --- Output writers ----------------------------------------------------------
 
 _CSV_SKIP = {"entry_ts_utc"}   # internal fields, not for CSV
@@ -1026,7 +1171,8 @@ def _save_csv(trades: list[BacktestTrade], path: Path) -> None:
 
 def _save_md(stats: dict, trades: list[BacktestTrade], path: Path,
              start: datetime, end: datetime,
-             session_report: Optional[dict] = None) -> None:
+             session_report: Optional[dict] = None,
+             vwap_cmp: Optional[dict] = None) -> None:
     monthly = stats.get("monthly", {})
 
     monthly_table = "| Month | Trades | Wins | P&L |\n|-------|--------|------|-----|\n"
@@ -1127,6 +1273,7 @@ generated: {datetime.now(NPT).strftime('%Y-%m-%d %H:%M NPT')}
 + f"| Skipped: no PDH/PDL data | {session_report['skip_no_pdh_pdl']} |\\n"
 + f"| Skipped: H4 ranging | {session_report['skip_ranging']} |\\n"
 + f"| **Scannable sessions** | **{session_report['scannable']}** |\\n"
++ f"| London skipped: prior session SL | {session_report['skip_prev_session_loss']} |\\n"
 + f"| SHORT blocked: bull regime (price > 200 SMA) | {session_report['skip_bull_regime_short']} |\\n"
 + f"| SHORT blocked: DXY H4 not bullish | {session_report['skip_short_no_bull_dxy']} |\\n"
 + f"| SHORT blocked: price above 50 SMA | {session_report['skip_short_above_50sma']} |\\n"
@@ -1143,12 +1290,34 @@ generated: {datetime.now(NPT).strftime('%Y-%m-%d %H:%M NPT')}
 
 ---
 
+## VWAP Filter Comparison
+
+Session VWAP resets at each session open (Asian 00:00 UTC, London 07:00 UTC, NY 12:00 UTC).
+VWAP-aligned = FVG entry is between session VWAP and TP target.
+
+{"_VWAP data not available._" if not vwap_cmp else (
+"| Metric | All Trades | VWAP-Aligned | Not Aligned |\\n"
++ "|--------|-----------|-------------|-------------|\\n"
++ f"| Total trades | {vwap_cmp['all']['trades']} | {vwap_cmp['aligned']['trades']} | {vwap_cmp['not_aligned']['trades']} |\\n"
++ f"| Wins | {vwap_cmp['all']['wins']} | {vwap_cmp['aligned']['wins']} | {vwap_cmp['not_aligned']['wins']} |\\n"
++ f"| Losses | {vwap_cmp['all']['losses']} | {vwap_cmp['aligned']['losses']} | {vwap_cmp['not_aligned']['losses']} |\\n"
++ f"| Breakevens | {vwap_cmp['all']['bes']} | {vwap_cmp['aligned']['bes']} | {vwap_cmp['not_aligned']['bes']} |\\n"
++ f"| Win Rate | {vwap_cmp['all']['win_rate']}% | {vwap_cmp['aligned']['win_rate']}% | {vwap_cmp['not_aligned']['win_rate']}% |\\n"
++ f"| Dir WR (excl BE) | {vwap_cmp['all']['dir_wr']}% | {vwap_cmp['aligned']['dir_wr']}% | {vwap_cmp['not_aligned']['dir_wr']}% |\\n"
++ f"| Net P&L | ${vwap_cmp['all']['net_pnl']:+,.2f} | ${vwap_cmp['aligned']['net_pnl']:+,.2f} | ${vwap_cmp['not_aligned']['net_pnl']:+,.2f} |\\n"
++ (f"\\n_Note: {vwap_cmp['no_vwap']} trade(s) had no VWAP data available (counted as aligned)._"
+   if vwap_cmp['no_vwap'] > 0 else "")
+)}
+
+---
+
 ## Notes
 
 - Strategy: ICT Silver Bullet -- Liquidity Sweep + MSS + FVG
 - Account: ${ACCOUNT_SIZE:,.0f} starting balance, {RISK_PCT}% risk per trade
-- Sessions traded: Asian Sweep (12:45-13:45 NPT), NY AM (19:45-20:45 NPT), NY PM (23:45-00:45 NPT)
+- Sessions traded: Asian Sweep (12:45-13:45 NPT), London Open (13:45-14:45 NPT), NY AM (19:45-20:45 NPT), NY PM (23:45-00:45 NPT)
 - Breakeven triggered at {int(BE_TRIGGER*100)}% of way to TP
+- VWAP: session VWAP computed from M5 candles; resets at Asian/London/NY session open
 - News filter NOT applied in backtest (conservative: would reduce trades)
 - High-risk days (Mon/Fri) NOT filtered in backtest
 
@@ -1164,7 +1333,7 @@ generated: {datetime.now(NPT).strftime('%Y-%m-%d %H:%M NPT')}
 
 ## Tags
 
-#backtest #xauusd #silver-bullet #ict
+#backtest #xauusd #silver-bullet #ict #vwap
 """
     path.write_text(content, encoding="utf-8")
     log.info("Markdown report saved: %s", path)
@@ -1237,9 +1406,10 @@ if __name__ == "__main__":
             print(f"{'=' * 60}")
             print(f"  Session Window Breakdown")
             _WIN_LABEL = {
-                "ASIAN_SWEEP_WINDOW":  "Asian Sweep (12:45-13:45)",
-                "NY_AM_SILVER_BULLET": "NY AM      (19:45-20:45)",
-                "NY_PM_SILVER_BULLET": "NY PM      (23:45-00:45)",
+                "ASIAN_SWEEP_WINDOW":         "Asian Sweep  (12:45-13:45)",
+                "LONDON_OPEN_SILVER_BULLET":  "London Open  (13:45-14:45)",
+                "NY_AM_SILVER_BULLET":        "NY AM        (19:45-20:45)",
+                "NY_PM_SILVER_BULLET":        "NY PM        (23:45-00:45)",
             }
             print(f"  {'':2} {'Window':<28} {'Cnt':>4}  {'W/L/BE':>8}  {'WR%':>5}  {'P&L':>10}")
             print(f"  {'':2} {'-'*28} {'-'*4}  {'-'*8}  {'-'*5}  {'-'*10}")
@@ -1270,13 +1440,36 @@ if __name__ == "__main__":
 
             # All trades table
             print(f"\n  All trades ({stats['total_trades']} total):")
-            print(f"  {'#':<4} {'Date':<12} {'Dir':<6} {'Entry':>8} {'Exit':>8} {'PnL':>9} {'Reason':<6} {'RR':>5}  {'Type':<12} Window")
+            print(f"  {'#':<4} {'Date':<12} {'Dir':<6} {'Entry':>8} {'Exit':>8} {'PnL':>9} {'Reason':<6} {'RR':>5}  {'VWAP':>8} {'Align':<6} Window")
             for t in trades:
                 win_marker = " *" if t.pnl > 0.01 else ("  " if abs(t.pnl) <= 0.01 else "  ")
+                vwap_str  = f"{t.vwap:>8.2f}" if t.vwap > 0 else "       -"
+                align_str = "YES" if t.vwap_aligned else "NO "
                 print(f"  {t.trade_id:<4} {t.date:<12} {t.direction:<6} "
                       f"{t.entry:>8.2f} {t.exit_price:>8.2f} "
                       f"${t.pnl:>+8.2f} {t.exit_reason:<6} 1:{t.rr_achieved:.1f}"
-                      f"  {t.entry_type:<12} {t.window}{win_marker}")
+                      f"  {vwap_str} {align_str}   {t.window}{win_marker}")
+
+            # VWAP comparison
+            vwap_cmp = _compute_vwap_comparison(trades)
+            vc_a  = vwap_cmp['all']
+            vc_al = vwap_cmp['aligned']
+            vc_na = vwap_cmp['not_aligned']
+            print(f"\n{'=' * 60}")
+            print(f"  VWAP FILTER COMPARISON")
+            print(f"  (aligned = FVG entry between session VWAP and TP)")
+            print(f"{'=' * 60}")
+            print(f"  {'Metric':<22} {'All':>10}  {'VWAP-Aligned':>12}  {'Not Aligned':>11}")
+            print(f"  {'-'*22} {'-'*10}  {'-'*12}  {'-'*11}")
+            print(f"  {'Trades':<22} {vc_a['trades']:>10}  {vc_al['trades']:>12}  {vc_na['trades']:>11}")
+            print(f"  {'Wins':<22} {vc_a['wins']:>10}  {vc_al['wins']:>12}  {vc_na['wins']:>11}")
+            print(f"  {'Losses':<22} {vc_a['losses']:>10}  {vc_al['losses']:>12}  {vc_na['losses']:>11}")
+            print(f"  {'Win Rate':<22} {vc_a['win_rate']:>9.1f}%  {vc_al['win_rate']:>11.1f}%  {vc_na['win_rate']:>10.1f}%")
+            print(f"  {'Dir WR (excl BE)':<22} {vc_a['dir_wr']:>9.1f}%  {vc_al['dir_wr']:>11.1f}%  {vc_na['dir_wr']:>10.1f}%")
+            print(f"  {'Net P&L':<22} ${vc_a['net_pnl']:>+9,.2f}  ${vc_al['net_pnl']:>+11,.2f}  ${vc_na['net_pnl']:>+10,.2f}")
+            if vwap_cmp['no_vwap']:
+                print(f"  [NOTE] {vwap_cmp['no_vwap']} trade(s) had no VWAP data -- counted as aligned.")
+            print(f"{'=' * 60}")
 
             # Session funnel report
             sr = _compute_session_report(session_best)
@@ -1292,6 +1485,7 @@ if __name__ == "__main__":
             print(f"  -- Skipped (H4 ranging)   : {sr['skip_ranging']}")
             print(f"  ----------------------------------------")
             print(f"  Scannable sessions        : {sr['scannable']}")
+            print(f"  London skipped (prev loss): {sr['skip_prev_session_loss']}")
             print(f"  SHORT: bull regime block  : {sr['skip_bull_regime_short']}")
             print(f"  SHORT: DXY not BULLISH    : {sr['skip_short_no_bull_dxy']}")
             print(f"  SHORT: price > 50 SMA     : {sr['skip_short_above_50sma']}")
@@ -1312,7 +1506,7 @@ if __name__ == "__main__":
             md_path  = OUTPUT_DIR / f"backtest_{ts_str}.md"
 
             _save_csv(trades, csv_path)
-            _save_md(stats, trades, md_path, start_dt, end_dt, sr)
+            _save_md(stats, trades, md_path, start_dt, end_dt, sr, vwap_cmp)
 
             # Also copy MD to Obsidian vault
             try:
